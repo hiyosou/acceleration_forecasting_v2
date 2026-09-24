@@ -201,4 +201,38 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-24] 専用uv環境の構築
+
+- 実装ファイル: なし(環境構築のみ)
+- 詳細: `uv sync --extra dev`を実行し、`acceleration_forecasting_v2/.venv`に
+  torch==2.7.1+cu118を含む専用環境を構築した(`torch.cuda.is_available() == True`を確認)。
+  ステップ1〜6は旧`acceleration_forecasting_12m/.venv-gpu`を一時的に借りてテストしていたが、
+  以降は本プロジェクト専用の環境でテストを実行する。
+- 判定: GO
+
+---
+
+## [2026-09-24] ステップ7: ForecastDatasetV2の実装
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/datasets/torch_dataset.py`(`ForecastDatasetV2`)
+  - `tests/test_torch_dataset.py`
+- テスト結果: **60件中60件パス**(既存52件 + 新規8件)。専用uv環境での初回実行。
+- レビュー懸念点: 特筆すべき問題は見つからなかった。旧`ForecastDataset`
+  ([acceleration_forecasting_12m/.../datasets/torch_dataset.py])のNaN→0変換パターン
+  (`_finite_zero`)・正規化ロジックを踏襲しつつ、"current"/"history"の統合(SPEC 1.1)、
+  "segment_weight"の追加(SPEC 1.1)、target_mode=absolute専用化(SPEC 1.6、
+  residualモードのguide_baseline加算分岐を削除)を反映した。
+- 入出力の具体例:
+  ```
+  入力: 正規化統計(mean=2.0, std=1.0)、保存された生の予測正解値=[3.0, ...]
+  出力: モデルに渡される正規化後の値 = (3.0 - 2.0) / 1.0 = 1.0
+
+  入力: モデルの出力(正規化空間で0.0)を物理単位に戻す
+  出力: 0.0 × 1.0 + 2.0 = 2.0(guideの値を足したりはしない — absoluteモードの決定通り)
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
