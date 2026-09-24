@@ -256,4 +256,35 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-24] ステップ9: セグメント単位重み付き損失の実装(+ステップ11 DDIMサンプリングを前倒し実装)
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/diffusion/process.py`(`DiffusionProcess`: コサインスケジュール、
+    `per_record_loss`、`model_output_to_x0_epsilon`、`ddim`)
+  - `src/acceleration_forecasting_v2/training/loss.py`(`SegmentWeightedMaskedLoss`)
+  - `tests/test_diffusion_process.py`, `tests/test_segment_weighted_loss.py`
+- 補足: SPEC.md成果物3のインターフェース定義には`DiffusionProcess`を明記していなかったが、
+  損失関数(`per_record_loss`の入力元)として必須の依存だったため本ステップで実装した。
+  あわせてDDIMサンプリング(実装順序案ステップ11の中核)も`DiffusionProcess.ddim`として
+  同時に実装済みとなった(旧`DiffusionProcess`が同じクラスに両方を持つ構造だったため、
+  分離するより自然だった)。ステップ11では残る「predict()相当の呼び出し口」のみを行う。
+  Min-SNR関連のコードは削除した(SPEC 1.5/1.6の決定により本プロジェクトでは使わないため、
+  不要な複雑さを持ち込まない)。
+- テスト結果: **89件中89件パス**(既存73件 + 新規16件)
+- レビュー懸念点:
+  - (修正済み)DDIMの`normalized_clip`(クリップ処理)を検証するテストが、実際には
+    「NaNが出ないこと」しか確認しておらず、クリップの効果自体を検証できていなかった
+    (弱いテスト)。`sampling_steps=1`・`eta=0`のときは最終出力が
+    「クランプ後のpredicted_clean」に厳密に一致するという性質を使い、固定出力の
+    ダミーモデルで具体的な数値(-1.0ちょうど)を検算するテストに書き直した。
+    クリップなしの場合は範囲を大きく超えることも対比で確認した。
+- 入出力の具体例:
+  ```
+  入力: セグメントAに10件(誤差0.20)、セグメントBに1件(誤差0.50)
+  出力: 重み付き平均 = 0.35(SPEC.md 1.1の手計算例と一致)
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
