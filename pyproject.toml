@@ -1,0 +1,37 @@
+[project]
+name = "acceleration-forecasting-v2"
+version = "0.1.0"
+description = "Segment-wide, repair-agnostic residual diffusion forecasting (rebuild of acceleration_forecasting_12m)"
+readme = "SPEC.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "numpy==2.5.1",
+  "pandas==3.0.3",
+  "scipy==1.18.0",
+  "PyYAML==6.0.3",
+  "tqdm==4.67.1",
+  "matplotlib==3.10.8",
+  "torch==2.7.1+cu118",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/acceleration_forecasting_v2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["gpu: requires CUDA", "integration: requires real source artifacts"]
+
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
