@@ -235,4 +235,25 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-24] ステップ8: ReferenceModulatedUNetV2(RMAモデル本体)の実装
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/models/reference_modulated_unet.py`
+  - `tests/test_reference_modulated_unet.py`
+- テスト結果: **73件中73件パス**(既存60件 + 新規13件)
+- レビュー懸念点:
+  - (修正済み)デフォルト設定(similarity無効・month_aligned・ratd_condition_reconstruction)
+    のテストしかなく、クラスが技術的にサポートしている非デフォルトの分岐
+    (similarity_bias有効・globalアテンション・residual_delta融合)が一度も
+    実行されていなかった。forward+backwardが両方通ることを確認するテストを追加した。
+- 入出力の具体例:
+  ```
+  入力: バッチサイズ4、ノイズ付き12か月系列(4,12)、履歴(4,6)、guide(4,3,12)
+  出力: ノイズの推定値(4,12) ← 入力と同じ形
+  パラメータ数: 約488万(旧リポジトリの同構成の実測値と同オーダーであることを確認)
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
