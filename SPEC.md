@@ -21,6 +21,7 @@
 | モデル実装 | RMA一本化、attention_mode/fusion_type/チャンネル構成は固定 |
 | 損失関数 | マスク付きMSE + セグメント単位重み付け(新規実装)。prediction_typeはepsilon(Min-SNRなし)を主軸に、v_predictionも並行比較 |
 | リポジトリ構成 | my_project内の新規フォルダ(本フォルダ)、旧12mへの追加は停止 |
+| target_mode(1.6節、ステップ6実装時に追加決定) | absolute(実測値を直接予測)。guideは条件としてのみ使用、ターゲットからの引き算はしない |
 
 ---
 
@@ -215,6 +216,24 @@ segment_level_mean = ( Σ_{s∈S} segment_mean_s ) / |S|  # 第2段階: セグ�
 
 ---
 
+## 1.6 target_mode(residual差分予測 か absolute実測値直接予測か)【ステップ6実装時に発見・追記】
+
+当初のSPEC.mdにはこの軸の決定が漏れていた(1.3節のRMA固定値は決めたが、target_modeは暗黙のままだった)。データセット構築(成果物5 ステップ6)の実装中に、1.3節で根拠にした実測(`artifacts_prediction_parameterization`)が**全てtarget_mode="absolute"**で行われていたことに気付き、確定させた。
+
+### 決定: `target_mode = "absolute"`
+
+- ターゲット(`target_values`)は`anchor.future_values`(実測値そのもの)。guideベースラインの引き算はしない。
+- guideは引き続きRMAのreference-attentionへの条件として使われる(`guide_values`/`guide_deltas`/`guide_similarities`)。
+- `guide_baselines`/`guide_softmax_weights`はターゲット構成には使わないが、「guideの単純な加重平均と比べてどれだけ拡散モデルが優れているか」を評価する参考値として引き続き算出・保存する(成果物2.1で訂正済み)。
+- `prediction_type`(1.5節、epsilon/v_prediction)とは独立な軸であり、どちらのtarget_modeでも「ノイズを予測する」という拡散プロセスの仕組み自体は変わらない。target_modeは「ノイズを加える対象の"クリーンな信号"を何と定義するか」だけを決める。
+
+### 実装への影響
+
+- `datasets/build.py`の`target_norm`(旧SPEC案の`residual_norm`から命名変更)は、model_trainの`target_values`(物理値、absolute)から直接fitする。
+- `RawSplit`/`ForecastDatasetV2`のtarget構築ロジックに、guide_baselineを減算するステップは存在しない。
+
+---
+
 # 成果物2: データ契約(I/O仕様)
 
 ## 2.1 新DBクエリ結果 → 学習用テンソルへの変換仕様
@@ -237,7 +256,7 @@ segment_level_mean = ( Σ_{s∈S} segment_mean_s ) / |S|  # 第2段階: セグ�
 [selected anchors] 1レコード = 1 (dataset_id, measurement_date, bin_start_m, bin_end_m)
         │
         │ GuideIndex.search() で allowed_splits に従い top_k=3 のguideを取得
-        │ softmax_guide_baseline で guide_baselines(12,), guide_softmax_weights(3,) を算出
+        │ softmax_guide_baseline で guide_baselines(12,), guide_softmax_weights(3,12) を算出
         ▼
 [.npy 保存形式] (split=model_train/model_validation/inference それぞれ別ディレクトリ)
 ```
@@ -251,10 +270,10 @@ segment_level_mean = ( Σ_{s∈S} segment_mean_s ) / |S|  # 第2段階: セグ�
 | `guide_deltas` | `(N, 3, 12)` | float32 | あり(`condition_norm.std`で除算のみ、平均は引かない。旧実装踏襲) | 変更なし |
 | `guide_similarities` | `(N, 3)` | float32 | なし | 変更なし |
 | `retrieval_masks` | `(N, 3)` | float32(0/1) | なし | 変更なし |
-| `guide_baselines` | `(N, 12)` | float32 | なし(物理値) | target_mode=residualの復元用。変更なし |
-| `guide_softmax_weights` | `(N, 3)` | float32 | なし | 変更なし |
+| `guide_baselines` | `(N, 12)` | float32 | なし(物理値) | **訂正**: target_mode=absolute決定(下記参照)によりターゲット構成には使わない。guideの単純平均という「素朴な予測」との比較用の評価参考値として引き続き算出・保存する |
+| `guide_softmax_weights` | `(N, 3, 12)` | float32 | なし | **訂正**: 当初`(N,3)`と誤記していたが、`softmax_guide_baseline`の実装(月ごとに有効なguideだけでsoftmaxを取り直すため、重みは月ごとに異なりうる)を確認した結果`(N,3,12)`が正しい。ステップ6実装時に発見・修正 |
 | **`segment_weights`**(新規) | `(N,)` | float32 | なし | `1/N_{s(i)}`(1.1参照)。split構築時に確定するため事前計算して保存する |
-| `target_values` | `(N, 12)` | float32 | あり(`residual_norm`) | 変更なし |
+| `target_values` | `(N, 12)` | float32 | あり(`target_norm`) | **訂正**: target_mode=absolute決定により、anchor.future_valuesそのもの(guide_baseline未使用)。正規化名も「residual_norm」から実態に合わせ「target_norm」に変更 |
 | `target_masks` | `(N, 12)` | float32(0/1) | なし | 変更なし |
 
 正規化統計(`condition_normalization.json`、`normalization.json`)は**`model_train`splitのみに`fit`し、model_validation/inferenceには`normalize`のみ適用する**(現行`Normalization.fit(training_values[train_mask>0], ...)`踏襲、[datasets/build.py:309-310](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/datasets/build.py#L309-L310))。

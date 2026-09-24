@@ -152,4 +152,53 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   責務として引き継ぐ。
 - 判定: GO
 
+---
+
+## [2026-09-24] ステップ6: データセット構築パイプライン一式(1回目STOP → 決定 → 実装)
+
+### STOP: target_modeがSPEC.mdで未決定だった
+
+- 判定: STOP
+- 理由: `datasets/build.py`のターゲット構築ロジックを書こうとしたところ、
+  `target_mode`(residual差分予測 vs absolute実測値直接予測)がSPEC.mdで一度も
+  明示的に決定されていないことに気付いた。1.3節でRMAの固定値を決めた際に根拠にした
+  実測データ(`artifacts_prediction_parameterization`等)が、確認し直すと
+  **全てtarget_mode="absolute"**で行われていたため、単純に「元々の設計思想は
+  residual」と決め打ちすると、1.3節の根拠と矛盾する組み合わせになってしまう。
+- ユーザーへの確認: 「ノイズ予測という拡散モデルの仕組み自体は変わるか」という質問を
+  受け、prediction_type(何を予測するか: ノイズ/v/x0)とtarget_mode(そもそも
+  "正解データ"をどう定義するか: 差分/実測値)が独立な軸であることを図解して回答。
+- 決定: **absolute**を採用(SPEC.md 1.6節として追記)。
+
+### 実装
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/datasets/baseline.py`(`softmax_guide_baseline`)
+  - `src/acceleration_forecasting_v2/datasets/normalization.py`(`Normalization`)
+  - `src/acceleration_forecasting_v2/datasets/build.py`(`build_raw_split`, `fit_condition_and_target_normalization`)
+  - `tests/test_dataset_build.py`
+  - `SPEC.md`(1.6節追加、guide_softmax_weightsの形状訂正、target_values/guide_baselinesの説明訂正)
+- テスト結果: **52件中52件パス**(既存47件 + 新規5件)
+- レビュー懸念点:
+  - (修正済み・SPEC.mdの誤記)`guide_softmax_weights`の形状を当初`(N,3)`と記載していたが、
+    実装元のコード(`softmax_guide_baseline`は月ごとに有効なguideでsoftmaxを取り直す)を
+    確認すると正しくは`(N,3,12)`だった。SPEC.md成果物2.1を訂正した。
+  - (修正済み)`test_build_raw_split_target_values_are_absolute_not_residual`が
+    最初失敗した。原因はテストフィクスチャの不備: guideの「現在値」をターゲットと
+    大きく異なる値(99.0)にしていたため、`max_current_difference`フィルタで
+    guide自体が検索結果から除外されてしまい、「guideありの状態でabsoluteを検証する」
+    という意図を満たせていなかった。guideの現在値と将来値を独立に指定できるよう
+    テストヘルパーを修正し、現在値は近く・将来値だけ大きく異なる、という現実的な
+    フィクスチャに直して再実行した。
+  - (修正済み)最初の形状検証テストも、同じ理由でguideが実際には見つからない状態で
+    「通ってしまっていた」ため、guideが確実に見つかる条件に修正し、
+    `guide_count == 1`のassertionを追加した。
+- 入出力の具体例:
+  ```
+  入力: ある区間・ある月(anchor)。似た過去の波形が1件見つかり、その将来推移は99で一定
+  出力: target_values(モデルが学習する正解) = anchor自身の実測値(例: 5)
+        guide_baselines(評価用の参考値、学習には使わない) = 99(guideの値)
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
