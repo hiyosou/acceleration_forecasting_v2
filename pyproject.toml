@@ -27,6 +27,9 @@ packages = ["src/acceleration_forecasting_v2"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["gpu: requires CUDA", "integration: requires real source artifacts"]
+# Windowsのグローバル一時フォルダ(%TEMP%\pytest-of-<user>)がこの環境では
+# PermissionErrorになるため、tmp_pathの基点をプロジェクト直下に固定する。
+addopts = "--basetemp=.pytest-tmp"
 
 [[tool.uv.index]]
 name = "pytorch-cu118"

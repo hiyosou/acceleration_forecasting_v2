@@ -1,5 +1,6 @@
 .venv/
 .pytest_cache/
+.pytest-tmp/
 __pycache__/
 *.py[cod]
 # Generated experiment artifacts (CSV/JSON/DB/models/plots can be very large).
