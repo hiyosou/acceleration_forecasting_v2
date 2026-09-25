@@ -390,4 +390,43 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-25] ステップ13: リーク検証(+ステップ6の抜けだった一括構築処理の補完)
+
+- 発見した抜け(ステップ6): 「retrievalの成果物から3splitのデータセットを一括で作る処理」が存在せず、
+  ステップ14(実データ実行)に必須だった。あわせて、リーク検証のために各anchorのguideの出所
+  (trend_id/dataset_id/model_split)がmetadataに残っている必要があった。
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/datasets/prepare.py`(`prepare_datasets`: anchor選定→guide検索→重み→正規化→書き出しを、
+    SPEC 2.3の規則どおりに結合。guide許可split: train→{train}, validation→{train}, inference→{train,validation}。
+    inferenceの埋め込みはDBに無いためAutoencoderでその場計算)
+  - `src/acceleration_forecasting_v2/datasets/verify.py`(`verify_dataset_leakage`: SPEC 2.3の検査項目を
+    実データにも使える関数化)
+  - `src/acceleration_forecasting_v2/datasets/build.py`(metadataにguide_trend_ids/guide_dataset_ids/guide_model_splitsを追加)
+  - `src/acceleration_forecasting_v2/retrieval/pipeline.py`(`write_vector_database`を関数として切り出し。挙動は不変)
+  - `tests/synthetic_artifacts.py`(合成retrieval成果物)、`tests/test_split_leakage.py`、`tests/test_end_to_end.py`
+- テスト結果: **154件中154件パス**(既存130件 + 新規24件)
+- SPEC 4のリーク検証項目の充足状況:
+  - dataset_idが1つのsplitにのみ存在 ✔ / trainのguideはtrainのみ ✔ / validationのguideはtrainのみ ✔ /
+    inferenceのguideに他inferenceなし ✔ / 同一dataset_id除外 ✔ / 正規化統計はmodel_trainのみ ✔ /
+    Autoencoder学習はinference波形に触れない(`MemmapWaveformDataset`に渡るindexを監視し、
+    inference波形に+1000を足して統計への混入がないことも確認) ✔
+- レビュー懸念点:
+  - (修正済み)`test_inference_targets_are_kept_out_of_model_inputs`が「shapeが非ゼロ」しか見ておらず
+    実質何も検証していない見せかけのテストだった。削除し、代わりに`verify_dataset_leakage`を実装した上で、
+    **わざとリークを混ぜたデータ(禁止splitのguide・同一dataset_idのguide・dataset_idの重複・誤った重み/正規化)を
+    検出できること**をテストした(検査自体の検出力を確認)。
+  - (確認済み)推論が正解を読まないことはステップ11のテストで確認済み。
+  - (残存)合成データでの検証。「実データ規模での実行」はステップ14で`verify_dataset_leakage`を実データに適用する。
+  - (残存)`guide_available_date`(近傍guideの時間制約)は`prepare`経由の統合テストでは実質検証されていない
+    (合成データは各セグメントの区間を1000m離しており近傍にならない)。単体では`test_guide_search.py`で検証済み。
+- 入出力の具体例:
+  ```
+  入力: 12セグメント×22か月の合成成果物(train 8 / validation 1 / inference 3セグメント)
+  出力: 3split全てが構築され、trainのguideは全てmodel_train由来、inferenceのguideはtrain/validation由来のみ。
+        verify_dataset_leakage → 違反0件。学習→推論→評価まで通しで実行できる(epsilon/v_prediction両方)。
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。

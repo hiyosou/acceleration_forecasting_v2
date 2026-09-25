@@ -43,6 +43,52 @@ def encode_waveforms(waveform_path, total_count, indices, checkpoint_path, devic
     return np.concatenate(embeddings, axis=0) if embeddings else np.zeros((0, model.embedding_dim), dtype=np.float32)
 
 
+def write_vector_database(artifact_dir, manifest, *, device=None, embedding_dim=EMBEDDING_DIM, overwrite_db=True):
+    """model_split列付きmanifestのdevelopment(model_train+model_validation)側を
+    埋め込み、`vector_database.sqlite`へ登録する。inference側はDBに入れない
+    (guide候補にもならない。クエリ時にその場で埋め込む、SPEC.md 2.3)。
+
+    前提: artifact_dirに waveforms.bin / trend_catalog.csv / autoencoder.pt がある。
+    """
+    artifact_dir = Path(artifact_dir)
+    development_rows = manifest.loc[manifest["model_split"].isin(["model_train", "model_validation"])].copy()
+    if development_rows.empty:
+        raise ValueError("DBへ登録するdevelopment(model_train+model_validation)レコードがありません。")
+    total_count = len(manifest)
+    embeddings = encode_waveforms(
+        artifact_dir / "waveforms.bin", total_count,
+        development_rows["waveform_index"].astype(int).to_numpy(),
+        artifact_dir / "autoencoder.pt", device=device, batch_size=512,
+    )
+
+    trends = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+    trend_split = development_rows.drop_duplicates("trend_id").set_index("trend_id")["model_split"]
+    trends = trends.loc[trends["trend_id"].isin(trend_split.index)].copy()
+    trends["model_split"] = trends["trend_id"].map(trend_split)
+
+    db_path = artifact_dir / "vector_database.sqlite"
+    connection = initialize_database(db_path, overwrite=overwrite_db)
+    try:
+        insert_trends(connection, trends)
+        for (_, row), embedding in zip(development_rows.iterrows(), embeddings):
+            insert_waveform_record(connection, row, embedding)
+        store_metadata(connection, {
+            "embedding_dim": int(embedding_dim),
+            "samples_per_waveform": SAMPLES_PER_BIN,
+            "record_count": int(len(development_rows)),
+            "similarity": "cosine",
+        })
+        connection.commit()
+    finally:
+        connection.close()
+
+    return {
+        "database_path": str(db_path),
+        "database_records": int(len(development_rows)),
+        "database_trends": int(len(trends)),
+    }
+
+
 def build_retrieval_database(
     artifact_dir,
     *,
@@ -78,42 +124,11 @@ def build_retrieval_database(
         device=device, epochs=epochs, batch_size=batch_size, embedding_dim=embedding_dim,
     )
 
-    development_rows = manifest.loc[manifest["model_split"].isin(["model_train", "model_validation"])].copy()
-    if development_rows.empty:
-        raise ValueError("DBへ登録するdevelopment(model_train+model_validation)レコードがありません。")
-    total_count = len(manifest)
-    embeddings = encode_waveforms(
-        artifact_dir / "waveforms.bin", total_count,
-        development_rows["waveform_index"].astype(int).to_numpy(),
-        artifact_dir / "autoencoder.pt", device=device, batch_size=512,
-    )
-
-    trends = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
-    trend_split = development_rows.drop_duplicates("trend_id").set_index("trend_id")["model_split"]
-    trends = trends.loc[trends["trend_id"].isin(trend_split.index)].copy()
-    trends["model_split"] = trends["trend_id"].map(trend_split)
-
-    db_path = artifact_dir / "vector_database.sqlite"
-    connection = initialize_database(db_path, overwrite=overwrite_db)
-    try:
-        insert_trends(connection, trends)
-        for (_, row), embedding in zip(development_rows.iterrows(), embeddings):
-            insert_waveform_record(connection, row, embedding)
-        store_metadata(connection, {
-            "embedding_dim": int(embedding_dim),
-            "samples_per_waveform": SAMPLES_PER_BIN,
-            "record_count": int(len(development_rows)),
-            "similarity": "cosine",
-        })
-        connection.commit()
-    finally:
-        connection.close()
+    database = write_vector_database(artifact_dir, manifest, device=device, embedding_dim=embedding_dim, overwrite_db=overwrite_db)
 
     return {
         "extraction": extraction_summary,
         "split": split_stats,
         "training": training_summary,
-        "database_path": str(db_path),
-        "database_records": int(len(development_rows)),
-        "database_trends": int(len(trends)),
+        **database,
     }

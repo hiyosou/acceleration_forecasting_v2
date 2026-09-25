@@ -8,6 +8,7 @@ SPEC.md 2.1のデータ契約に対応。target_modeは壁打ちで確定した"
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import numpy as np
@@ -108,6 +109,10 @@ def build_raw_split(
             "valid_history_months": anchor.valid_history_months,
             "valid_future_months": anchor.valid_future_months,
             "guide_count": len(guides), "segment_weight": segment_weight,
+            # guideの出所(リーク検証・追跡用): 各guideのtrend_id/dataset_id/model_split。
+            "guide_trend_ids": json.dumps([str(guide["trend_id"]) for guide in guides]),
+            "guide_dataset_ids": json.dumps([str(guide["dataset_id"]) for guide in guides]),
+            "guide_model_splits": json.dumps([str(guide["model_split"]) for guide in guides]),
         })
         arrays["history_values"].append(anchor.history_values)
         arrays["history_masks"].append(anchor.history_mask)
