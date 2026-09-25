@@ -332,4 +332,28 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-25] ステップ11: DDIM推論の呼び出し口(predict)の実装
+
+- 実装ファイル: `src/acceleration_forecasting_v2/inference/predict.py`(`predict`, `load_process`)、`tests/test_predict.py`
+- 補足: DDIMサンプリング本体はステップ9で`DiffusionProcess.ddim`として完成済み。本ステップは
+  checkpoint復元・1レコードあたり`num_samples`本の生成・物理値への逆変換とクリップ・
+  median/p10/p90/stdの算出と保存(`predictions.csv`, `samples.npz`, `prediction_run.json`)。
+- テスト結果: **111件中111件パス**(既存102件 + 新規9件)
+- レビュー懸念点:
+  - (修正済み)`samples.npz`にtrend_idsをobject型で保存していたため`allow_pickle=False`で
+    読めず、テストが1件失敗した。固定長のU型で保存するよう修正(pickleに依存しない形式)。
+  - (対応済み)推論は正解(target_values/target_masks)を一切読まない(`include_targets=False`)。
+    ファイルを削除しても動くことを`test_prediction_does_not_read_target_files`で確認(SPEC 2.3のリーク防止)。
+  - (残存)実データ・実モデルでの推論は未実施(ステップ14)。sampling_steps/eta等の最適値の選定処理
+    (旧`select_sampling`)は本リポジトリでは実装しない(設定の枝分かれ防止方針)。
+- 入出力の具体例:
+  ```
+  入力: 推論splitの5レコード、num_samples=6、sampling_steps=4
+  出力: predictions.csv(5×12=60行、p10<=median<=p90、全て0.1〜6.0の範囲)、
+        samples.npz(samples shape=(5,6,12))
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
