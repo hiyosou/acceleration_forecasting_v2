@@ -235,3 +235,42 @@ def test_autoencoder_training_never_touches_inference_waveforms(tmp_path, monkey
     assert normalization["split"] == "model_train"
     # inference波形には+1000を足してある。それが統計に混ざっていれば平均は大きくずれる。
     assert abs(normalization["mean"]) < 1.0
+
+
+# --- 推論セットの間引き(評価用セット) -----------------------------------------------
+
+def test_thin_evenly_keeps_everything_when_under_the_limit_or_unlimited():
+    from acceleration_forecasting_v2.datasets.prepare import thin_evenly
+    items = list(range(7))
+    assert thin_evenly(items, None) == items
+    assert thin_evenly(items, 7) == items
+    assert thin_evenly(items, 20) == items
+
+
+def test_thin_evenly_is_ordered_deterministic_and_spans_the_whole_range():
+    from acceleration_forecasting_v2.datasets.prepare import thin_evenly
+    items = list(range(100))
+    picked = thin_evenly(items, 10)
+    assert picked == thin_evenly(items, 10)
+    assert picked == sorted(picked) and len(picked) == 10
+    assert picked[0] == 0 and picked[-1] == 99
+    gaps = np.diff(picked)
+    assert gaps.max() - gaps.min() <= 1  # ほぼ等間隔
+
+
+def test_inference_thinning_limits_records_per_segment_to_evaluable_ones(tmp_path):
+    artifact_dir = tmp_path / "artifacts"
+    build_artifacts(artifact_dir, n_datasets=12, months=22)
+    full = prepare_datasets(artifact_dir, tmp_path / "full", device="cpu")
+    thin = prepare_datasets(artifact_dir, tmp_path / "thin", device="cpu", inference_max_per_segment=2)
+    frame = pd.read_csv(tmp_path / "thin" / "inference" / "metadata.csv", encoding="utf-8-sig")
+    assert frame.groupby("dataset_id").size().max() <= 2
+    assert (frame["valid_future_months"] >= 8).all()  # 評価に使えるanchorだけが残る
+    full_frame = pd.read_csv(tmp_path / "full" / "inference" / "metadata.csv", encoding="utf-8-sig")
+    assert (full_frame["valid_future_months"] < 8).any()  # 間引き無しには正解の足りないanchorも含まれる
+    assert thin["splits"]["inference"]["anchors"] < full["splits"]["inference"]["anchors"]
+    # trainとvalidationは間引きの影響を受けない。
+    for split in ("model_train", "model_validation"):
+        assert thin["splits"][split] == full["splits"][split]
+    manifest = pd.read_csv(artifact_dir / "split_manifest.csv", encoding="utf-8-sig")
+    assert verify_dataset_leakage(tmp_path / "thin", manifest) == []

@@ -40,11 +40,13 @@ def _expand(batch, num_samples):
 @torch.inference_mode()
 def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", device=None,
             num_samples=100, sampling_steps=50, eta=0.0, initial_noise_scale=1.0,
-            batch_size=8, seed=42, use_ema=True, bounds=(PHYSICAL_MIN, PHYSICAL_MAX)):
+            batch_size=8, seed=42, use_ema=True, bounds=(PHYSICAL_MIN, PHYSICAL_MAX), mixed_precision=None):
     """指定splitの全レコードを予測し、predictions.csvとsamples.npzを書き出す。
 
     正解(target_values)は一切読み込まない(include_targets=False)ため、
     未来の実測値が予測に混入することはない。
+
+    mixed_precision: Noneならcudaのときだけbf16 autocastを使う(学習と同じ精度設定)。
 
     Returns:
         サマリdict(件数・設定)。
@@ -53,6 +55,8 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     process, config = load_process(checkpoint_path, device, use_ema=use_ema)
+    use_autocast = device.type == "cuda" if mixed_precision is None else bool(mixed_precision)
+    autocast_dtype = torch.bfloat16 if use_autocast and device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
     dataset = ForecastDatasetV2(dataset_dir / split, dataset_dir, include_targets=False)
     metadata = pd.read_csv(dataset_dir / split / "metadata.csv", encoding="utf-8-sig")
@@ -66,11 +70,12 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     for batch in loader:
         batch = {key: value.to(device) for key, value in batch.items()}
         size = batch["history_values"].shape[0]
-        normalized = process.ddim(
-            _expand(batch, num_samples), shape=(size * num_samples, 12), sampling_steps=sampling_steps,
-            eta=eta, normalized_clip=normalized_clip, generator=generator, initial_noise_scale=initial_noise_scale,
-        )
-        physical = dataset.physical_prediction(normalized.cpu().numpy(), bounds=bounds)
+        with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
+            normalized = process.ddim(
+                _expand(batch, num_samples), shape=(size * num_samples, 12), sampling_steps=sampling_steps,
+                eta=eta, normalized_clip=normalized_clip, generator=generator, initial_noise_scale=initial_noise_scale,
+            )
+        physical = dataset.physical_prediction(normalized.float().cpu().numpy(), bounds=bounds)
         all_samples.append(physical.reshape(size, num_samples, 12))
     samples = np.concatenate(all_samples, axis=0)
 
@@ -94,7 +99,7 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
         "split": split, "record_count": int(len(samples)), "num_samples": int(num_samples),
         "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed),
         "prediction_type": config["prediction_type"], "bounds": [float(bounds[0]), float(bounds[1])],
-        "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema),
+        "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema), "mixed_precision": bool(use_autocast),
     }
     (output_dir / "prediction_run.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

@@ -33,6 +33,8 @@ def _parser():
     p.add_argument("--artifact-dir", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--max-datasets-per-split", type=int)
+    p.add_argument("--inference-max-per-segment", type=int,
+                   help="inferenceを評価用セットとして構築し、セグメントごとに日付均等で最大N件へ間引く")
     p.add_argument("--device")
 
     p = commands.add_parser("verify", help="構築済みデータセットのリーク検査(違反があれば終了コード1)")
@@ -87,7 +89,8 @@ def main(argv=None) -> int:
     elif args.command == "prepare":
         from acceleration_forecasting_v2.datasets.prepare import prepare_datasets
         result = prepare_datasets(args.artifact_dir, args.output_dir, device=args.device,
-                                  max_datasets_per_split=args.max_datasets_per_split)
+                                  max_datasets_per_split=args.max_datasets_per_split,
+                                  inference_max_per_segment=args.inference_max_per_segment)
     elif args.command == "verify":
         import pandas as pd
         from acceleration_forecasting_v2.datasets.verify import verify_dataset_leakage

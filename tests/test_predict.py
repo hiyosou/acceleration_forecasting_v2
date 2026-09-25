@@ -111,3 +111,23 @@ def test_run_summary_records_configuration(trained, tmp_path):
     assert summary["eta"] == 0.5
     assert summary["prediction_type"] == "epsilon"
     assert (tmp_path / "out" / "prediction_run.json").is_file()
+
+
+def test_mixed_precision_is_off_on_cpu_by_default(trained, tmp_path):
+    summary = _predict(trained, tmp_path / "out")
+    assert summary["mixed_precision"] is False
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="CUDA required")
+def test_bf16_sampling_on_cuda_stays_close_to_fp32(trained, tmp_path):
+    dataset_dir, checkpoint = trained
+    kwargs = dict(device="cuda", num_samples=16, sampling_steps=8, batch_size=5, seed=0)
+    fp32 = predict(dataset_dir, checkpoint, tmp_path / "fp32", mixed_precision=False, **kwargs)
+    bf16 = predict(dataset_dir, checkpoint, tmp_path / "bf16", mixed_precision=True, **kwargs)
+    assert fp32["mixed_precision"] is False and bf16["mixed_precision"] is True
+    a = pd.read_csv(tmp_path / "fp32" / "predictions.csv")["prediction_median"].to_numpy()
+    b = pd.read_csv(tmp_path / "bf16" / "predictions.csv")["prediction_median"].to_numpy()
+    assert np.isfinite(b).all()
+    print("mean |median(fp32)-median(bf16)| =", float(np.abs(a - b).mean()))
+    assert np.abs(a - b).mean() < 0.15

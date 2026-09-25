@@ -64,13 +64,26 @@ def _inference_query_vectors(artifact_dir, manifest, trend_ids, device) -> dict:
     return vectors
 
 
+def thin_evenly(anchors, limit):
+    """anchors(日付昇順)を、日付順に均等な間隔で最大`limit`件へ間引く(決定的、乱数を使わない)。"""
+    if limit is None or len(anchors) <= int(limit):
+        return list(anchors)
+    positions = np.unique(np.round(np.linspace(0, len(anchors) - 1, int(limit))).astype(int))
+    return [anchors[int(position)] for position in positions]
+
+
 def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_months=MIN_HISTORY_MONTHS,
                      min_target_months=MIN_TARGET_MONTHS, min_guide_months=MIN_GUIDE_MONTHS,
-                     temperature=0.1, max_current_difference=0.5, max_datasets_per_split=None) -> dict:
+                     temperature=0.1, max_current_difference=0.5, max_datasets_per_split=None,
+                     inference_max_per_segment=None) -> dict:
     """`build_retrieval_database`の出力ディレクトリから学習用データセットを構築する。
 
     Args:
         max_datasets_per_split: 動作確認用。指定すると各splitで(dataset_id昇順の)先頭N個のセグメントだけを使う。
+        inference_max_per_segment: 指定すると、inferenceを「評価用セット」として構築する:
+            正解が`min_target_months`か月以上ある(=評価に使える)anchorだけを残し、セグメントごとに
+            日付が均等になるよう最大N件へ間引く。推論(DDIM)の計算量を抑えるためで、trainとvalidationには影響しない。
+            未指定なら従来どおり、推論時点で利用可能なanchorを全て含める(production_ready基準)。
     """
     artifact_dir, output_dir = Path(artifact_dir), Path(output_dir)
     manifest = pd.read_csv(artifact_dir / "split_manifest.csv", encoding="utf-8-sig")
@@ -96,11 +109,17 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
             dataset_ids = dataset_ids[: int(max_datasets_per_split)]
         anchors = []
         for dataset_id in dataset_ids:
-            anchors.extend(select_anchors_for_segment(
+            segment_anchors = select_anchors_for_segment(
                 split_trends.loc[split_trends["dataset_id"] == dataset_id], split=split,
                 min_history_months=min_history_months, min_target_months=min_target_months,
                 history_months=HISTORY_MONTHS, forecast_months=FORECAST_MONTHS,
-            ))
+            )
+            if split == "inference" and inference_max_per_segment is not None:
+                segment_anchors = thin_evenly(
+                    [anchor for anchor in segment_anchors if anchor.valid_future_months >= min_target_months],
+                    inference_max_per_segment,
+                )
+            anchors.extend(segment_anchors)
         anchors_by_split[split] = anchors
 
     inference_ids = {anchor.trend_id for anchor in anchors_by_split["inference"]}
@@ -126,7 +145,8 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
     summary = {
         "config": {"min_history_months": int(min_history_months), "min_target_months": int(min_target_months),
                    "min_guide_months": int(min_guide_months), "temperature": float(temperature),
-                   "max_current_difference": max_current_difference, "max_datasets_per_split": max_datasets_per_split},
+                   "max_current_difference": max_current_difference, "max_datasets_per_split": max_datasets_per_split,
+                   "inference_max_per_segment": inference_max_per_segment},
         "splits": {split: {"anchors": int(len(raw.metadata)), "datasets": int(raw.metadata["dataset_id"].nunique()),
                            "anchors_with_guides": int((raw.metadata["guide_count"] > 0).sum())}
                    for split, raw in raw_splits.items()},
