@@ -453,4 +453,23 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   加えて、実データでの学習(200エポック×2構成)もGPUで数時間規模になる見込みのため、実行方針の確認が必要。
 - 判定: **STOP**(ユーザーの判断待ち)
 
+## [2026-09-25] ステップ14 準備: 抽出結果の取り込みと最小CLI(ユーザー判断: 旧waveforms.binを入力スナップショットとして取り込む)
+
+- STOPへの対応: ユーザーが「旧artifactsのwaveforms.binを入力スナップショットとして取り込む」を選択。
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/retrieval/snapshot.py`(`import_extraction_snapshot`)
+  - `src/acceleration_forecasting_v2/retrieval/pipeline.py`(`build_retrieval_from_extraction`を切り出し。
+    生CSV経路・取り込み経路の両方が共通で使う)
+  - `src/acceleration_forecasting_v2/cli.py`(パイプライン各段階のみの最小CLI。実験ごとにサブコマンドを増やさない)
+  - `tests/test_snapshot.py`, `tests/test_cli.py`
+- 取り込みの仕様: 旧ファイルは読むだけでコード上は依存しない。トレンドは12か月で再構築、manifestにdataset_idを付与、
+  旧の日付単位splitは捨てる。対応するトレンドが無い行は除外し波形を詰め直す(元と同一の波形を保つことをテスト)。
+  waveforms.binのサイズ不正・必須列欠落・waveform_index重複・対応トレンド0件は明示的にエラー。
+- テスト結果: **165件中165件パス**(既存154件 + 新規11件)。取り込み→DB構築→3split構築→リーク検査、
+  およびCLIで全段階(epsilon/v_prediction両方の学習→推論→評価→比較表)を通しで実行するテストを含む。
+- レビュー懸念点:
+  - (残存)取り込みのトレンド再構築は実データで約50分かかる(1回のみ、バックグラウンド実行)。
+  - (残存)`build_trend`は1件あたり約23msと遅い(旧実装から不変)。今回は1回限りのため最適化しない。
+- 判定: GO(実データ実行は継続中)
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。

@@ -89,6 +89,27 @@ def write_vector_database(artifact_dir, manifest, *, device=None, embedding_dim=
     }
 
 
+def build_retrieval_from_extraction(artifact_dir, *, device=None, epochs=100, batch_size=128,
+                                    embedding_dim=EMBEDDING_DIM, overwrite_db=True):
+    """抽出済みの成果物(waveforms.bin / split_manifest.csv / trend_catalog.csv)から、
+    split確定 → Autoencoder学習 → DB構築 を行う。生CSVから抽出した場合も、
+    既存の抽出結果を取り込んだ場合(`snapshot.import_extraction_snapshot`)も共通。
+    """
+    artifact_dir = Path(artifact_dir)
+    manifest_path = artifact_dir / "split_manifest.csv"
+    manifest = pd.read_csv(manifest_path, encoding="utf-8-sig")
+    manifest = assign_model_split(manifest)
+    manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
+    split_stats = split_summary(manifest)
+
+    training_summary = train_autoencoder(
+        manifest_path, artifact_dir / "waveforms.bin", artifact_dir,
+        device=device, epochs=epochs, batch_size=batch_size, embedding_dim=embedding_dim,
+    )
+    database = write_vector_database(artifact_dir, manifest, device=device, embedding_dim=embedding_dim, overwrite_db=overwrite_db)
+    return {"split": split_stats, "training": training_summary, **database}
+
+
 def build_retrieval_database(
     artifact_dir,
     *,
@@ -101,34 +122,8 @@ def build_retrieval_database(
     progress=True,
     overwrite_db=True,
 ):
-    """生CSV一式から検索用SQLite DB(vector_database.sqlite)を構築する。
-
-    Returns:
-        summary dict。主な副作用として artifact_dir 以下に
-        waveforms.bin / split_manifest.csv(model_split列付き) / trend_catalog.csv /
-        autoencoder.pt / normalization.json / training_history.csv /
-        vector_database.sqlite を書き出す。
-    """
-    artifact_dir = Path(artifact_dir)
-
-    extraction_summary = extract_manifest_and_trends(waveform_dir, trend_dir, artifact_dir, progress=progress)
-
-    manifest_path = artifact_dir / "split_manifest.csv"
-    manifest = pd.read_csv(manifest_path, encoding="utf-8-sig")
-    manifest = assign_model_split(manifest)
-    manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
-    split_stats = split_summary(manifest)
-
-    training_summary = train_autoencoder(
-        manifest_path, artifact_dir / "waveforms.bin", artifact_dir,
-        device=device, epochs=epochs, batch_size=batch_size, embedding_dim=embedding_dim,
-    )
-
-    database = write_vector_database(artifact_dir, manifest, device=device, embedding_dim=embedding_dim, overwrite_db=overwrite_db)
-
-    return {
-        "extraction": extraction_summary,
-        "split": split_stats,
-        "training": training_summary,
-        **database,
-    }
+    """生CSV一式から検索用SQLite DB(vector_database.sqlite)を構築する(抽出から全て実行)。"""
+    extraction_summary = extract_manifest_and_trends(waveform_dir, trend_dir, Path(artifact_dir), progress=progress)
+    rest = build_retrieval_from_extraction(artifact_dir, device=device, epochs=epochs, batch_size=batch_size,
+                                           embedding_dim=embedding_dim, overwrite_db=overwrite_db)
+    return {"extraction": extraction_summary, **rest}
