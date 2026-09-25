@@ -356,4 +356,38 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-25] ステップ12: 評価関数(record-level / segment-level)の実装
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/evaluation/metrics.py`(`target_metrics`、旧実装を無変更で移植)
+  - `src/acceleration_forecasting_v2/evaluation/aggregate.py`(`evaluate_record_level`, `evaluate_segment_level`,
+    `bootstrap_record_level`, `bootstrap_segment_level`, `confidence_interval`)
+  - `src/acceleration_forecasting_v2/evaluation/evaluate.py`(`evaluate`, `per_target_frame`, `build_comparison_table`)
+  - `tests/test_evaluation.py`
+- 仕様どおりの点(SPEC 1.4): segment-levelは「セグメント内平均→セグメント間平均」の2段階平均。
+  bootstrapもdataset_id単位の復元抽出で、segment-level側は各反復でセグメント内平均を単純平均する
+  (旧実装は集計がanchor重み付きのままだった問題を解消)。record-level側のbootstrapは旧実装と同じ。
+- 追加した点: 評価の参考としてguide加重平均ベースラインの誤差(`baseline_MAE`/`baseline_RMSE`)を
+  両レベルで集計(SPEC 1.6でguide_baselinesを評価参考値として残すと決めたことに対応)。
+  有効な正解月が`min_target_months`(既定8)未満のレコードは評価から除外(学習側のeligibilityと整合)。
+- 実装しなかった点: 画像出力、複数実験ツリーを横断する比較処理(成果物乱立の防止)。
+  モデル間比較は`build_comparison_table`にsummaryを渡す形に限定。
+- テスト結果: **130件中130件パス**(既存111件 + 新規19件)
+- レビュー懸念点:
+  - (修正済み)テスト作成時、coverageの手計算(3/4=0.75)を一度0.5と誤記し、訂正コメントを
+    残したままの状態だったため、実行前に整理して正しい期待値に直した(実装のバグではない)。
+  - (確認済み)SPEC 1.4の手計算例(A:10件MAE0.20、B:1件MAE0.50)で record-level=0.227、
+    segment-level=0.35 を集計関数単体とevaluate()全体の両方で検証。bootstrapは「取りうる値の集合」を
+    理論値で検証(segment-levelは{0.20,0.35,0.50}のみ、record-levelは件数重みの値)。
+  - (残存)指標のうち`correlation`は12点中の相関でNaNになりうるため、集計時はNaNを除外して平均している
+    (旧実装と同じ挙動)。除外件数は出力していない。
+- 入出力の具体例:
+  ```
+  入力: 推論5件(segA 4件は予測が+0.1ずれ、segB 1件は+0.5ずれ)
+  出力: record-level MAE = 0.18、segment-level MAE = 0.30(セグメントに公平)
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
