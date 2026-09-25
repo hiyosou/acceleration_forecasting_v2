@@ -303,7 +303,7 @@ segment_level_mean = ( Σ_{s∈S} segment_mean_s ) / |S|  # 第2段階: セグ�
 | 1 | `dataset_id`(セグメント)は必ず単一splitにのみ属する | `model_train`/`model_validation`/`inference`が排他的 | [splitting.py:82-101](../acceleration_retrieval/splitting.py#L82-L101) |
 | 2 | guide検索の許可split | train→{train}、validation→{train}、inference→{train,validation} | [datasets/build.py:295](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/datasets/build.py#L295) |
 | 3 | guide検索の同一セグメント除外 | クエリと同じ`dataset_id`は常に除外 | [retrieval/search.py:63](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/retrieval/search.py#L63) |
-| 4 | 空間近傍guideの時間順序制約 | `near`な候補は`guide_available_date < query_date`のみ許可 | [retrieval/search.py:70-72](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/retrieval/search.py#L70-L72) |
+| 4 | 空間近傍guideの時間順序制約 | `near`な候補は`guide_available_date < query_date`のみ許可。**【実データ検証で判明した限界】** 制約は空間的に近い候補にしか掛からず、遠い区間のguideは起点日より後のデータでも使われる(inferenceのguideの42.5%が起点日より後に計測、PROGRESS.md最終レビュー指摘1) | [retrieval/search.py:70-72](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/retrieval/search.py#L70-L72) |
 | 5 | 正規化統計の`fit`範囲 | `model_train`のみ | [datasets/build.py:309-310](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/datasets/build.py#L309-L310) |
 | 6 | Autoencoder(埋め込み)の学習データ範囲 | development(=train+validation)側の波形のみ。inference側波形は埋め込み計算(クエリ用)はするが学習には使わない | [acceleration_retrieval README](../acceleration_retrieval/README.md) 実行順セクション |
 | 7 | inference anchorの適格性判定 | 未来値を参照しない`is_production_inference_ready`のみで判定(offlineの`is_offline_sequence_valid`は使わない) | [datasets/build.py:114-115](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/datasets/build.py#L114-L115) |

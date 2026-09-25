@@ -494,4 +494,99 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   - (残存)bf16の影響は合成データでのみ確認。実モデルでの差は実データ実行時に(必要なら)fp32で再確認する。
 - 判定: GO
 
+## [2026-09-25] ステップ14: 実データでのepsilon / v_prediction比較の実行
+
+### 実行内容(全て実データ、CLI経由。コマンドと所要時間)
+| 段階 | 所要 | 結果 |
+|---|---|---|
+| import-snapshot(旧waveforms.bin取り込み、トレンド12か月再構築) | 約50分 | 420,686波形・1,061セグメント・トレンド113,802件、除外0件 |
+| build-retrieval(Autoencoder+ベクトルDB) | 約7分 | 42エポックで早期終了、検証loss 約0.0004 |
+| prepare(3split構築、inferenceは評価用に間引き) | 約70分 | train 36,657 / validation 3,301 / inference 1,119 anchors(432 / 51 / 116セグメント)、guide取得率100% |
+| verify(リーク検査) | 14秒 | 違反0件 |
+| epsilon: 学習 / 推論 / 評価 | 1.21h / 1.68h / 4秒 | 40エポックで早期終了(best=epoch30) |
+| v_prediction: 学習 / 推論 / 評価 | 1.21h / 1.68h / 4秒 | 40エポックで早期終了(best=epoch31) |
+- 設定(ユーザー選択): 60エポック・patience 10、推論は100サンプル×50ステップ・bf16、inferenceはセグメント最大10件に間引き。
+- 実行中のwarning/error: なし(ログにTraceback無し。ログ検索で"error"が引っかかった3件は指標名`peak_*_error`)。
+
+### 結果(inference 1,119件・116セグメント、bootstrap 1000回)
+| 指標 | epsilon(seg-level) | v_prediction(seg-level) | 備考 |
+|---|---|---|---|
+| MAE | 0.2131 [0.194, 0.233] | **0.1945** [0.175, 0.214] | guide平均ベースライン 0.3228 |
+| RMSE | 0.2594 | **0.2395** | |
+| correlation | 0.3006 | 0.3017 | 両者とも低い |
+| coverage_p10_p90 | **0.7636** | 0.7389 | 公称0.80 |
+| mean_interval_width | 0.639 | 0.510 | vは区間が約20%狭い |
+- record-levelとsegment-levelはほぼ一致(MAE 0.2114/0.2131、0.1931/0.1945)。
+- セグメント対応ありの差(v−eps)のbootstrap 95%CI: MAE −0.0186 [−0.0268, −0.0101]、RMSE −0.0198 [−0.0289, −0.0115]
+  (vが良いセグメントは68〜70%)。coverage −0.0247 [−0.0464, −0.0030]。→ vは点予測が有意に良く、epsilonは区間の較正がわずかに良い。
+- どちらもguide平均ベースライン(MAE 0.323)を上回る(epsilon −34%、v −40%)。
+- 旧実験で見られた極端な較正悪化(v_predictionのcoverage 0.62)は今回は起きていない(0.74)。
+- 解釈上の注意: 各構成1シード。correlation約0.30・隣接月の増減方向一致率約53%(ほぼ偶然水準)と、月ごとの推移形状の再現は弱い。
+  MAEの改善は主に「水準」を当てていることによる可能性が高い。x0_prediction・複数シードは未検証(スコープ外)。
+
+## [2026-09-25] 最終レビュー
+
+### 1. SPEC.md全項目チェックリスト
+`src/acceleration_forecasting_v2/`配下の位置。PARTIALは仕様どおりだが留意点あり。
+| 項目 | 判定 | 場所 |
+|---|---|---|
+| 1.1 セグメント重み(loss側・validationにも適用、Σ(w·l)/Σw) | PASS | training/loss.py:16、training/train.py:63(validation)・:88(train) |
+| 1.2 補修跨ぎ打ち切り・マスク(保存NaN→入力直前で0) | PASS | retrieval/trends.py `build_trend`、datasets/torch_dataset.py:41 |
+| 1.3 RMA固定値(month_aligned/ratd/similarity無効/64ch等) | PASS | models/reference_modulated_unet.py:189 |
+| 1.4 record/segment-level(2段階平均)・bootstrap | PASS | evaluation/aggregate.py:29,40,46,60、evaluation/evaluate.py:66 |
+| 1.5 epsilon/v_prediction並行比較(2回学習、同一メトリクス) | PASS | training/train.py、cli.py、evaluation/evaluate.py:96 |
+| 1.6 target_mode=absolute | PASS | datasets/build.py:55(ターゲット=anchor.future_values)、torch_dataset.py |
+| 入力形状6か月統一・フラットMLP | PASS | datasets/history.py:16、reference_modulated_unet.py(condition_encoder) |
+| anchor: セグメント内全月・min_target 8 | PASS | datasets/anchors.py:51 |
+| 出力12か月固定 | PASS | common/constants.py |
+| 2段階dataset_id分割(80/20→9/1) | PASS | retrieval/splitting.py:30 |
+| retrieval断ち切り・コピーして出発点 | PASS | retrieval/*(旧artifactsは一度きりの入力ファイルとしてsnapshot.py:32が読むのみ、旧コードはimportしない) |
+| 2.1 データ契約(各配列のshape/dtype/正規化) | PASS | datasets/build.py:55,135,168(実データ: history(N,6)、guide(N,3,12)、target(N,12)、segment_weights(N,))。SPEC誤記(guide_softmax_weights)は訂正済み |
+| 2.2 6か月履歴→12次元→MLP | PASS | reference_modulated_unet.py |
+| 2.3 リーク項目1(dataset_idは1つのsplit) | PASS | datasets/verify.py:19、tests/test_split_leakage.py |
+| 2.3 項目2(guide許可split) | PASS | datasets/prepare.py `GUIDE_SOURCE_SPLITS` |
+| 2.3 項目3(同一dataset_id除外) | PASS | retrieval/search.py |
+| 2.3 項目4(近傍guideの時間制約) | **PARTIAL** | retrieval/search.py:78。仕様どおり「近傍のみ」に実装。下記レビュー指摘1参照 |
+| 2.3 項目5(正規化はmodel_trainのみ) | PASS | datasets/build.py:168、verify.py |
+| 2.3 項目6(Autoencoderはinference波形に触れない) | PASS | retrieval/autoencoder_training.py、tests/test_split_leakage.py |
+| 2.3 項目7(inferenceはproduction-ready判定) | PASS | datasets/anchors.py:51 |
+| 2.3 項目8(重みはsplit内で完結) | PASS | datasets/prepare.py、verify.py |
+| 2.3 項目9(推論の正解を読まない) | PASS | inference/predict.py(include_targets=False、テストで正解ファイル削除でも動作) |
+| 3 インターフェース(AnchorCandidate、select_anchors…、SegmentWeightedMaskedLoss、RMA、評価、Dataset) | PASS | 上記各ファイル |
+| 3 `build_future_target`(単体関数) | PARTIAL | 独立関数ではなく`TrendCatalog.build_trend`に統合(SPEC 2.1が「DBには確定済みのfuture_values/maskが入る」前提だったため。PROGRESSステップ3に記録済み) |
+| 4 受け入れテスト観点 | PASS | 170件。SPEC記載名とは異なるが各観点を網羅。新旧retrieval差分は実データ10ファイル・1,028波形で全件一致を確認 |
+| 5 実装順序 ステップ1〜14 | PASS | 本ログの各ステップ |
+
+### 2. 実データでのend-to-end実行(少量ではなく全量で実施)
+- 各段階のshape: history_values (N,6) / guide_values,guide_deltas (N,3,12) / guide_similarities (N,3) / target_values (N,12) / segment_weights (N,);
+  モデル入出力 (B,12)→(B,12)、パラメータ数 4,876,537。
+- 学習曲線: epsilon train 0.488→0.243、validation 0.868→0.241(best epoch30)。v_prediction train 0.723→0.382、validation 1.027→0.382(best epoch31)。
+  いずれもvalidationが単調に近く低下し、10エポック改善なしで早期終了(過学習の兆候なし)。
+- 評価指標: 上記の結果表のとおり。
+- warning/error: なし。
+
+### 3. 第三者(シニアMLエンジニア)視点のコードレビュー
+致命的(正しさを損なうバグ): **なし**(テスト170件パス、リーク検査違反0、新旧retrieval差分一致)。
+
+重大(結果の解釈・妥当性に影響):
+1. **guide検索の時間制約が「空間的に近い区間」にしか掛かっておらず、未来のデータがguideに使われている**(retrieval/search.py:78。旧実装から継承、SPEC 2.3項目4も同じ仕様)。
+   実データで定量化: inferenceのguideの**42.5%が予測起点日より後に計測**され、**75.6%は、起点日時点ではその12か月先の推移がまだ確定していない**。
+   (train 46.3%/83.3%、validation 44.5%/80.9%)。dataset_id単位のリーク(train/inference間)ではないが、
+   「実運用で予測する時点では手に入らない情報」を使っている。よって報告した精度は、運用時の精度より楽観的な可能性が高い。
+   epsilonとv_predictionは同じ条件で比較しているため、両者の相対比較の公平性は保たれる。対処するなら
+   「guideのavailable_date < 起点日」を全候補に課す(旧`acceleration_retrieval`のREADMEにある`strict-time`相当)。再実行に約6時間。
+2. **各構成1シード、評価は間引き後の1,119件(116セグメント)**。差の有意性は対応ありbootstrapで確認したが、シード間ばらつきは未評価。
+3. 月ごとの推移形状の再現は弱い(correlation 約0.30、増減方向一致率 約53%)。MAE改善の多くは水準の一致による可能性。
+
+軽微:
+4. 構築が遅い: `select_anchors_for_segment`が行ごとのiterrows、`build_trend`が1件約23ms(旧実装から不変)。prepareに約70分、import約50分。
+5. `dataset_build_id`は正規化統計+件数のハッシュで、統計・件数が同じで配列の中身だけ違う場合はresume時に検出できない。
+6. `verify_dataset_leakage`は時間順序(重大1)を検査しない。
+7. 評価でcorrelationのNaN(12点中定数など)は除外して平均しているが、除外件数を出力していない。
+8. LF/CRLFの改行変換警告(`.gitattributes`未設定)。動作には影響しない。
+9. テストファイル間の相互import(`test_training`のヘルパーを他が利用)。pytestのrootdir依存で、単独実行時に壊れやすい。
+10. bf16推論の影響は合成データ(差0.0016)でのみ確認。実モデルでfp32との差は未確認。
+
+- 判定: GO(全14ステップ完了)。重大指摘1は、ユーザーの判断待ち。
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
