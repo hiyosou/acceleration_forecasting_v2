@@ -287,4 +287,49 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   ```
 - 判定: GO
 
+---
+
+## [2026-09-25] Git/GitHub整備(ステップ9とステップ10の間)
+
+- 内容: `acceleration_forecasting_v2/`を`my_project`から切り離して独立したGitリポジトリ化
+  (`git subtree split`で10コミットの履歴を保持)。`my_project`側は追跡から外し、
+  `.gitignore`に追加。`gh`(GitHub CLI)をwingetでインストールし、
+  https://github.com/hiyosou/acceleration_forecasting_v2 をPublicで作成してpush済み。
+- 注意: 公開前の確認で、コミット作者情報に大学メールアドレスが含まれる旨を説明した上で、
+  ユーザーが「そのままPublicでpush」を明示的に選択した。
+- 以降のコミットは自動ではpushしない(pushは都合のよいタイミングでユーザー判断)。
+- 判定: GO
+
+---
+
+## [2026-09-25] ステップ10: 学習ループの実装
+
+- 実装ファイル:
+  - `src/acceleration_forecasting_v2/training/train.py`(`train`, `validation_loss`, `dataset_build_id`)
+  - `src/acceleration_forecasting_v2/training/ema.py`
+  - `src/acceleration_forecasting_v2/datasets/build.py`に`write_split`/`write_dataset`を追加
+  - `tests/test_training.py`
+- 補足(ステップ6の抜けの補完): ステップ6は`build_raw_split`(配列の組み立て)までで、
+  `ForecastDatasetV2`が読む`.npy`ディレクトリを**書き出す処理が存在しなかった**。
+  学習ループの前提となるため`write_dataset`(正規化統計はmodel_trainのみからfit)を追加した。
+- テスト結果: **102件中102件パス**(既存89件 + 新規13件)
+- レビュー懸念点:
+  - (対応済み)validation lossは、SPEC 1.1の決定どおり`segment_weight`を適用し、
+    さらに「バッチごとの重み付き平均の平均」ではなく検証セット全体の Σ(w·loss)/Σw で
+    計算する(バッチ構成に結果が依存しない)。`test_validation_loss_is_segment_weighted_over_whole_set_not_per_batch`
+    でSPEC 1.1の手計算例(0.35 ≠ 単純平均0.227)を、バッチサイズ3に分割した状態で検証。
+  - (対応済み)CPUテストだけではGPU固有経路(bf16 autocast・GradScaler)が未実行のため、
+    `gpu`マーカー付きの実行テストを追加し、実GPUで通ることを確認した。
+  - (確認済み)loss減少テストは合成データで train 0.57→0.14 と十分な余裕があり、偶然ではない。
+  - (残存)勾配計算に`segment_weight`が効いていること自体を直接検証するテストは無い
+    (重み付き平均の数式は`test_segment_weighted_loss.py`で検証済みで、trainはそれを呼ぶだけ)。
+  - (残存)実データでの学習は未実施(ステップ14で実施)。
+- 入出力の具体例:
+  ```
+  入力: 合成データ(履歴平均+月ごとの傾きが正解)64件、15エポック、prediction_type=epsilon
+  出力: train_loss 0.95→0.14、validation_loss 1.33→0.87(いずれも単調に近く減少)
+        best_model.pt / last_model.pt / training_history.csv / resolved_config.json を出力
+  ```
+- 判定: GO
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。

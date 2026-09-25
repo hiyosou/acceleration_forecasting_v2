@@ -143,3 +143,42 @@ def fit_condition_and_target_normalization(model_train_raw: RawSplit) -> tuple[N
     target = model_train_raw.arrays["target_values"][model_train_raw.arrays["target_masks"] > 0]
     target_norm = Normalization.fit(target, "model_train_target_absolute")
     return condition_norm, target_norm
+
+
+def write_split(raw: RawSplit, split_dir) -> None:
+    """RawSplit(正規化前の物理値)を`ForecastDatasetV2`が読める形で保存する。
+
+    正規化はDataset側の`__getitem__`で適用するため、ここでは物理値のまま
+    (欠測はNaNのまま、SPEC.md 1.2)保存する。
+    """
+    from pathlib import Path
+
+    split_dir = Path(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    for name in ARRAY_NAMES:
+        np.save(split_dir / f"{name}.npy", np.asarray(raw.arrays[name], dtype=np.float32))
+    raw.metadata.to_csv(split_dir / "metadata.csv", index=False, encoding="utf-8-sig")
+
+
+def write_dataset(raw_splits: dict, dataset_dir) -> dict:
+    """model_train/model_validation/inferenceのRawSplitを保存し、正規化統計を書き出す。
+
+    正規化統計は必ず`model_train`のみからfitする(SPEC.md 2.1・2.3)。
+
+    Returns:
+        {"condition_norm": Normalization, "target_norm": Normalization}
+    """
+    from pathlib import Path
+
+    dataset_dir = Path(dataset_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    required = ("model_train", "model_validation")
+    for split in required:
+        if split not in raw_splits:
+            raise ValueError(f"{split} のRawSplitが必要です。")
+    condition_norm, target_norm = fit_condition_and_target_normalization(raw_splits["model_train"])
+    condition_norm.save(dataset_dir / "condition_normalization.json")
+    target_norm.save(dataset_dir / "target_normalization.json")
+    for split, raw in raw_splits.items():
+        write_split(raw, dataset_dir / split)
+    return {"condition_norm": condition_norm, "target_norm": target_norm}
