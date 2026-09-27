@@ -613,4 +613,16 @@ SPEC.md の実装順序案(成果物5)に沿って、ステップごとの実装
   - 未確定の6点(Q1〜Q6)を同書§10に列挙。ユーザー確認待ち。
 - 判定: GO(定義まで)
 
+## [2026-09-27] EMBEDDING_DIM 256→64 への変更・実データ再実行(ユーザー判断)
+
+- 決定: `common/constants.py`の`EMBEDDING_DIM`を256から64に変更。retrieval全体(Autoencoder・
+  ベクトルDB・guide検索)がこの値を参照するため、Autoencoder再学習→ベクトルDB再構築→3split再構築
+  →リーク検査→epsilon/v_prediction再学習→推論→評価→比較まで全て実データで再実行する。
+- 影響範囲の確認: 抽出結果(waveforms.bin/split_manifest.csv/trend_catalog.csv、`artifacts/retrieval`)は
+  次元に依存しないため再取り込み不要。`assign_model_split`は同じseed・同じdataset_id集合であれば
+  再実行しても同一の分割になるため、train/validation/inferenceの区分は変わらない。
+  guide_values/guide_deltas/guide_similarities(検索結果に依存)は変わるため、データセットは再構築が必要。
+- テスト: 変更後もテスト170件中170件パス(合成データはdim=8等を使うため次元変更の影響を受けない)。
+- 判定: GO(実行を継続)
+
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
