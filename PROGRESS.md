@@ -704,3 +704,35 @@ build-retrieval(dim64) 13分 → prepare 57分 → verify 13秒 → epsilon学�
   `self_retrieval_check`実行時、`all_pass=True`、`s1.pass_rate=1.0`、`s3.self_returned=0`。
   波形を1件改ざんした場合は`s2.cosine_min`が0.999999を下回り`all_pass=False`になることを確認。
 - 判定: GO(実データでの実行はステップ5でまとめて行う)
+
+## [2026-09-28] SELF_GUIDE_CHECK.md 実装(ステップ3+4: `inference/self_guide_diagnostics.py` + CLI)
+
+- 実装ファイル: `src/acceleration_forecasting_v2/inference/self_guide_diagnostics.py`
+  (`diagnose_guide_conditioning`、`_diagnose_with_process`、`compute_shuffled_partner_indices`、
+  `_PairedForecastDataset`、`_disable_guide`、`_per_record_attention_ranks`)、`cli.py`に
+  `diagnose-guide-conditioning`サブコマンド追加。
+- テスト: `tests/test_self_guide_diagnostics.py`(11件、新規)、`tests/test_cli.py`に1件追加。
+  `.venv/Scripts/python.exe -m pytest tests/ -q` → **196 passed**(既存184 + 新規12、回帰なし)。
+- 設計の要点:
+  - shuffledの相手は`compute_shuffled_partner_indices`で「別dataset_idになるまでインデックスを
+    +1ずつずらす(循環)」決定的な方式にした(旧実装の「次のレコード」は同一セグメント内の
+    隣接anchorを掴む恐れがあるため、Q4で確定済みの方針)。
+  - `_PairedForecastDataset`で本人+shuffled相手のguide系フィールドを1つのDataLoaderにまとめ、
+    2つのDataLoaderを並走させる同期ずれのリスクを避けた。
+  - `attention_rank_1/2/3`は、`ReferenceModulatedUNetV2.diagnostic_stats()`がバッチ次元まで
+    平均化する前の`last_attention`(batch,heads,length,36)から独自に集計し、**レコードごとの
+    真の値**にした(ユーザー承認済みの設計変更点)。`reference_context_norm`は
+    `diagnostic_stats()`をそのまま使い、バッチ単位の参考値として明記した。
+  - `reference_blocks`/`diagnostic_stats()`を持たないモデル(テスト用ダミーモデル)には
+    `attention_rank_*`/`reference_context_norm`をNaNで埋める設計にし、MAE/出力L1差の検証に
+    RMA固有の実装を要求しないようにした。
+- レビューで見つけて修正した1点: `_diagnose_with_process`が`next(process.model.parameters()).device`
+  でdeviceを取得していたため、パラメータを持たないテスト用ダミーモデル(`_GuideIgnoringModel`等)を
+  注入すると`StopIteration`で落ちた。`DiffusionProcess`が必ず持つ`alpha_bars`テンソルの
+  deviceを使うよう修正(検出力テストで発覆)。
+- 入出力の具体例: 合成データ(4データセット×小規模)で2エポック学習したcheckpointに対し
+  timestep=900で診断すると、`condition_usage_per_target_t900.csv`にレコード数ぶんの行、
+  `guide_advantage_vs_shuffled/disabled`等の列が出力されることを確認。guideを一切参照しない
+  ダミーモデルではadvantageが厳密に0、guideの加重平均だけを返すダミーモデルではdisabled時に
+  出力L1差が明確に大きくなることを確認(検出力の直接証拠)。
+- 判定: GO(実データでの実行はステップ5でまとめて行う)
