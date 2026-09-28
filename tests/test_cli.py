@@ -1,9 +1,11 @@
 """cli.main が各段階を順に呼べることの確認(合成データ、CPU、小規模)。"""
 
 import json
+import sqlite3
 
 import pandas as pd
 
+from synthetic_artifacts import build_artifacts
 from test_snapshot import _make_source
 
 from acceleration_forecasting_v2.cli import main
@@ -68,3 +70,26 @@ def test_cli_verify_returns_nonzero_when_leakage_is_present(tmp_path, capsys):
     frame.to_csv(path, index=False, encoding="utf-8-sig")
     code, result = _run(capsys, "verify", "--dataset-dir", dataset, "--artifact-dir", artifacts)
     assert code == 1 and result["violation_count"] >= 1
+
+
+def test_cli_self_check_passes_on_a_clean_database(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    build_artifacts(artifacts, n_datasets=12, months=22, seed=0)
+
+    code, result = _run(capsys, "self-check", "--artifact-dir", artifacts, "--output-dir", tmp_path / "self_check",
+                        "--device", "cpu")
+    assert code == 0 and result["all_pass"] is True
+    assert (tmp_path / "self_check" / "self_retrieval_summary.json").is_file()
+
+
+def test_cli_self_check_returns_nonzero_when_the_database_is_broken(tmp_path, capsys):
+    artifacts = tmp_path / "artifacts"
+    build_artifacts(artifacts, n_datasets=12, months=22, seed=0)
+    connection = sqlite3.connect(str(artifacts / "vector_database.sqlite"))
+    connection.execute("UPDATE metadata SET value=? WHERE key='record_count'", ("999999",))
+    connection.commit()
+    connection.close()
+
+    code, result = _run(capsys, "self-check", "--artifact-dir", artifacts, "--output-dir", tmp_path / "self_check",
+                        "--device", "cpu")
+    assert code == 1 and result["all_pass"] is False

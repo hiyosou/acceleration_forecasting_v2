@@ -4,6 +4,10 @@
 実験ごとにサブコマンドを増やさない方針(成果物の乱立を防ぐ)なので、ここにあるのは
 パイプラインの段階そのものだけ:
   import-snapshot → build-retrieval → prepare → verify → train → predict → evaluate → compare
+
+上記のパイプライン段階に加えて、既存成果物の事後検証ツールを2つ持つ(いずれもSPEC.mdの
+パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
+  self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md、未実装)
 """
 
 from __future__ import annotations
@@ -73,6 +77,14 @@ def _parser():
     p = commands.add_parser("compare", help="複数runの評価summaryを比較表(CSV)にまとめる")
     p.add_argument("--run", action="append", required=True, metavar="NAME=EVALUATION_DIR")
     p.add_argument("--output", required=True)
+
+    p = commands.add_parser("self-check", help="guide検索の自己一致/再エンコード一致/自己除外を検証(違反があれば終了コード1)")
+    p.add_argument("--artifact-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--sample-size", type=int, default=20000)
+    p.add_argument("--chunk-size", type=int, default=250)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device")
     return parser
 
 
@@ -113,7 +125,7 @@ def main(argv=None) -> int:
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate
         result = evaluate(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split,
                           bootstrap=args.bootstrap)
-    else:
+    elif args.command == "compare":
         from acceleration_forecasting_v2.evaluation.evaluate import build_comparison_table
         summaries = {}
         for item in args.run:
@@ -122,6 +134,12 @@ def main(argv=None) -> int:
         table = build_comparison_table(summaries)
         table.to_csv(args.output, encoding="utf-8-sig")
         result = {"output": str(args.output), "columns": list(table.columns), "metrics": list(table.index)}
+    else:
+        from acceleration_forecasting_v2.retrieval.self_check import self_retrieval_check
+        result = self_retrieval_check(args.artifact_dir, args.output_dir, sample_size=args.sample_size,
+                                      chunk_size=args.chunk_size, seed=args.seed, device=args.device)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return 0 if result["all_pass"] else 1
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
 
