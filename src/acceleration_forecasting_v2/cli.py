@@ -7,7 +7,7 @@
 
 上記のパイプライン段階に加えて、既存成果物の事後検証ツールを2つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
-  self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md、未実装)
+  self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md)
 """
 
 from __future__ import annotations
@@ -85,6 +85,17 @@ def _parser():
     p.add_argument("--chunk-size", type=int, default=250)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device")
+
+    p = commands.add_parser("diagnose-guide-conditioning",
+                            help="学習済みcheckpointが実際にguide入力を使っているかを診断(再学習なし)")
+    p.add_argument("--dataset-dir", required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--split", default="model_validation")
+    p.add_argument("--timesteps", type=int, nargs="+", default=[900])
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--device")
     return parser
 
 
@@ -134,12 +145,17 @@ def main(argv=None) -> int:
         table = build_comparison_table(summaries)
         table.to_csv(args.output, encoding="utf-8-sig")
         result = {"output": str(args.output), "columns": list(table.columns), "metrics": list(table.index)}
-    else:
+    elif args.command == "self-check":
         from acceleration_forecasting_v2.retrieval.self_check import self_retrieval_check
         result = self_retrieval_check(args.artifact_dir, args.output_dir, sample_size=args.sample_size,
                                       chunk_size=args.chunk_size, seed=args.seed, device=args.device)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return 0 if result["all_pass"] else 1
+    else:
+        from acceleration_forecasting_v2.inference.self_guide_diagnostics import diagnose_guide_conditioning
+        result = diagnose_guide_conditioning(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split,
+                                             timesteps=tuple(args.timesteps), seed=args.seed,
+                                             batch_size=args.batch_size, device=args.device)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
 

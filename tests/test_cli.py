@@ -9,6 +9,7 @@ from synthetic_artifacts import build_artifacts
 from test_snapshot import _make_source
 
 from acceleration_forecasting_v2.cli import main
+from acceleration_forecasting_v2.datasets.build import write_dataset
 
 
 def _run(capsys, *argv):
@@ -93,3 +94,25 @@ def test_cli_self_check_returns_nonzero_when_the_database_is_broken(tmp_path, ca
     code, result = _run(capsys, "self-check", "--artifact-dir", artifacts, "--output-dir", tmp_path / "self_check",
                         "--device", "cpu")
     assert code == 1 and result["all_pass"] is False
+
+
+def test_cli_diagnose_guide_conditioning_runs_against_a_trained_checkpoint(tmp_path, capsys):
+    from dataclasses import replace
+
+    from test_self_guide_diagnostics import _raw_split_with_datasets
+
+    dataset = tmp_path / "dataset"
+    write_dataset({
+        "model_train": _raw_split_with_datasets(16, seed=1, n_datasets=4),
+        "model_validation": _raw_split_with_datasets(8, seed=2, n_datasets=4),
+    }, dataset)
+    code, _ = _run(capsys, "train", "--dataset-dir", dataset, "--output-dir", tmp_path / "run", "--epochs", 1,
+                   "--batch-size", 8, "--device", "cpu", "--no-progress")
+    assert code == 0
+
+    code, result = _run(capsys, "diagnose-guide-conditioning", "--dataset-dir", dataset, "--checkpoint",
+                        tmp_path / "run" / "best_model.pt", "--output-dir", tmp_path / "diagnose",
+                        "--split", "model_validation", "--timesteps", 900, "--batch-size", 4, "--device", "cpu")
+    assert code == 0 and result["record_count"] == 8
+    frame = pd.read_csv(tmp_path / "diagnose" / "condition_usage_per_target_t900.csv", encoding="utf-8-sig")
+    assert len(frame) == 8
