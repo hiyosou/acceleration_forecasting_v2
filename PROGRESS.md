@@ -736,3 +736,68 @@ build-retrieval(dim64) 13分 → prepare 57分 → verify 13秒 → epsilon学�
   ダミーモデルではadvantageが厳密に0、guideの加重平均だけを返すダミーモデルではdisabled時に
   出力L1差が明確に大きくなることを確認(検出力の直接証拠)。
 - 判定: GO(実データでの実行はステップ5でまとめて行う)
+
+## [2026-09-28] ステップ5: 実データでの実行(self-check + 自己ガイド検証、両checkpoint)
+
+### self-check(実DB、335,986件、64次元)
+
+`self-check --artifact-dir artifacts/retrieval --output-dir artifacts/retrieval/self_check`
+(既定パラメータ)。所要時間 **約33分**(11:26:36〜11:59:55)。事前の見積もり(数分)より
+大幅に長かった — 原因はS3(自己除外、標本20,000件)が`GuideIndex.search`を20,000回
+個別に呼ぶが、`search`内部の`eligible`計算(`np.fromiter`でsplitごとの所属をPythonループで
+判定)がレコード数(335,986件)に比例するため、1呼び出しあたり数十msかかり総計で
+数十分規模になる(`prepare`ステップが57分かかっていたのと同じ性質のコスト、既存の
+`retrieval/search.py`のコードで新規のバグではない)。今後この検証を頻繁に回す場合は
+`--sample-size`を絞ることを検討する余地があるが、今回は既定のまま完走させた。
+
+結果: **`all_pass = true`**。
+- S1(保存済み自己一致、全件335,986件): pass_rate=1.0、同点0件、self_similarity
+  0.99999946〜1.00000060、margin_min=0.00377(常に自分が最大)、alignment_failures=0。
+- S2(再エンコード一致、標本20,000件): cosine_min=0.99999976、bit_identical_rate=99.8%、
+  device=cuda、CPU参考値も同じcosine_min(GPU/CPUで実質差なし)。
+- S3(自己除外、標本20,000件): self/same_dataset/same_date のいずれも0件返却。
+  `filter_effect_rate=0.885`(除外規則を外すと88.5%のケースで上位3件に同一dataset_idが
+  混入する — 除外規則が実際に効いていることの直接証拠)。
+- DB本体はチェック前後でSHA256不変、WAL/journalファイルも生成されず(読み取り専用を確認)。
+
+**結論: guide検索の「配管」(埋め込みの保存・整列・除外規則)は健全。**
+
+### 自己ガイド検証(実checkpoint、model_validation全件3,301件、t=900)
+
+`diagnose-guide-conditioning --dataset-dir artifacts/dataset --checkpoint
+artifacts/runs/{epsilon,v_prediction}/model/best_model.pt --split model_validation
+--timesteps 900 --device cuda`。両checkpointとも数十秒で完了(DDIMを使わない1回の
+フォワードのみのため、`predict`より大幅に速い)。
+
+| 指標 | epsilon | v_prediction | 旧リポジトリ(通常モデル、v_prediction、29件、3シード) |
+|---|---|---|---|
+| normal_MAE_mean | 0.2080 | 0.1783 | (参考: 全体評価のMAEは別途evaluate参照) |
+| guide_advantage_vs_shuffled(mean) | -0.0022 | +0.0014 | (未記録) |
+| **guide_advantage_vs_disabled(mean)** | **+0.0681** | **-0.00058** | +0.00004 / −0.0010 / −0.0014 |
+| normal_vs_disabled_output_L1(mean) | 0.0574 | 0.0187 | (未記録) |
+| attention_rank_1/2/3(mean) | 0.328/0.330/0.332 | 0.328/0.334/0.328 | (未記録) |
+| reference_context_norm(mean) | 0.526 | 0.545 | (未記録) |
+
+**重要な発見:**
+- **v_predictionは旧リポジトリの「通常モデル」実測値(実質ゼロ〜わずかにマイナス)と
+  ほぼ同じ傾向を示した**(-0.00058、旧: +0.00004/-0.0010/-0.0014)。母数が29件→3,301件と
+  大きく異なるにもかかわらず同じ傾向が再現された — 「guideを使う能力はあるが、実際の
+  検索結果ではほぼ使われていない」という旧リポジトリの示唆がv2でも支持される。
+- **epsilonはv_predictionと明確に異なり、guide_advantage_vs_disabledが+0.068と
+  実質的に大きい**(disabled_MAE 0.276 vs normal_MAE 0.208、guideを外すと明確に悪化する)。
+  一方でguide_advantage_vs_shuffled(-0.0022、正しいguide vs 入れ替えたguide)はほぼゼロに近く、
+  「guideが**存在すること自体**は使っているが、**どのguideが返ってきたか(検索結果の具体的な
+  中身)にはほとんど反応していない**」という、旧リポジトリでは観測されていなかった新しい
+  非対称なパターンを示した。
+- attention_rank_1/2/3(guide 3件それぞれへの平均attention配分)はepsilon・v_predictionとも
+  ほぼ均等(0.33前後)で、3件のguideのうち特定の順位に偏って注目している様子はない。
+- 総合すると、全体評価(§前掲の実データ比較)ではv_predictionの方がepsilonよりMAEが
+  低かった(0.178 vs 0.208、本表のnormal_MAE_meanと整合)が、**その精度の高さはguide入力を
+  実際に活用した結果ではない**(disabled化してもほぼ無変化)。逆にepsilonは全体MAEでは
+  やや劣るものの、guideを実際に活用して誤差を下げている。「生成モジュールの精度向上」を
+  今後検討する際、v_predictionの検索精度(guide品質)を上げても改善に直結しない可能性が
+  高く、epsilon側やguideの使われ方自体(attentionの設計・融合方法)を見直す方が有望、
+  という具体的な示唆が得られた。
+- 判定: GO。SELF_RETRIEVAL_CHECK.md・SELF_GUIDE_CHECK.mdともに実行まで完了。
+  成果物自体(`artifacts/retrieval/self_check/`、`artifacts/runs/*/self_guide_check/`)は
+  `.gitignore`済みのため非コミット、本ログの記録のみコミットする。
