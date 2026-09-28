@@ -676,3 +676,31 @@ build-retrieval(dim64) 13分 → prepare 57分 → verify 13秒 → epsilon学�
 - 判定: GO(定義まで、実装・実行は未着手)
 
 以降、SPEC.mdの実装順序案ステップ2から、1ステップずつ「実装→テスト→レビュー→説明→コミット→本ログ追記」のサイクルを回す。
+
+## [2026-09-28] SELF_RETRIEVAL_CHECK.md 実装(ステップ1+2: `retrieval/self_check.py` + CLI)
+
+- 実装ファイル: `src/acceleration_forecasting_v2/retrieval/self_check.py`(`self_retrieval_check`、
+  内部の`_chunked_unfiltered_pass`/`_check_stored_self_match`/`_check_re_encoding`/`_check_self_exclusion`)、
+  `cli.py`に`self-check`サブコマンド追加。
+- テスト: `tests/test_self_check.py`(12件、新規)、`tests/test_cli.py`に2件追加。
+  `.venv/Scripts/python.exe -m pytest tests/ -q` → **184 passed**(既存170 + 新規14、回帰なし)。
+- 設計の要点:
+  - S1(保存済み自己一致、全件)とS3の`filter_effect_rate`(除外規則を外した場合の上位3件)は、
+    どちらも「制限なしの全件コサイン類似度ランキング」を必要とするため、`_chunked_unfiltered_pass`に
+    まとめて1回の計算で共有する(二重計算しない)。
+  - `record_pass`(個別レコードの合否)はS1の類似度・最大性・正規化・有限性のみで決め、DB整列・
+    件数整合・自己除外の破損などは実行全体の`all_pass`にのみ反映する(定義書の設計どおり)。
+  - 同一埋め込みの重複は「同点」として許容し記録するのみ(`tied_count`/`strict_top1_rate`で報告、
+    `record_pass`は落とさない)。
+- レビューで見つけて修正した2点(検出力テストで発覆):
+  1. 非有限(NaN/Inf)な埋め込みが1件でもあると、コサイン類似度の行列積で**他の全レコードの
+     max_otherまでNaN汚染**し、全件が`is_maximum`で不合格になっていた。類似度計算専用に
+     非有限行をゼロベクトルへ隔離する(`finite_ok`/`norm_ok`自体は元の値で判定するため検出力は
+     落ちない)よう修正。
+  2. S3(自己除外)で、埋め込みが破損していて検索クエリとして使えない場合に`GuideIndex.search`が
+     `ValueError`を送出し、**その1件で自己検索の検証全体が異常終了**していた。該当レコードだけを
+     検索失敗(`record_pass=False`)として記録し、他のレコードの検証は継続するよう修正。
+- 入出力の具体例: 合成DB(12セグメント×22か月、model_train/validation合計198件)で
+  `self_retrieval_check`実行時、`all_pass=True`、`s1.pass_rate=1.0`、`s3.self_returned=0`。
+  波形を1件改ざんした場合は`s2.cosine_min`が0.999999を下回り`all_pass=False`になることを確認。
+- 判定: GO(実データでの実行はステップ5でまとめて行う)
