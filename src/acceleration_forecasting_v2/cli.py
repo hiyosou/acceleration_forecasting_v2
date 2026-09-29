@@ -96,6 +96,11 @@ def _parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--device")
+
+    p = commands.add_parser("build-self-reference-dataset",
+                            help="guideを自分自身の正解に差し替えたデータセットを構築(生成モジュールの上限性能測定用)")
+    p.add_argument("--source-dataset-dir", required=True)
+    p.add_argument("--output-dataset-dir", required=True)
     return parser
 
 
@@ -151,11 +156,14 @@ def main(argv=None) -> int:
                                       chunk_size=args.chunk_size, seed=args.seed, device=args.device)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return 0 if result["all_pass"] else 1
-    else:
+    elif args.command == "diagnose-guide-conditioning":
         from acceleration_forecasting_v2.inference.self_guide_diagnostics import diagnose_guide_conditioning
         result = diagnose_guide_conditioning(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split,
                                              timesteps=tuple(args.timesteps), seed=args.seed,
                                              batch_size=args.batch_size, device=args.device)
+    else:
+        from acceleration_forecasting_v2.datasets.self_reference import build_self_reference_dataset
+        result = build_self_reference_dataset(args.source_dataset_dir, args.output_dataset_dir)
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0
 

@@ -116,3 +116,19 @@ def test_cli_diagnose_guide_conditioning_runs_against_a_trained_checkpoint(tmp_p
     assert code == 0 and result["record_count"] == 8
     frame = pd.read_csv(tmp_path / "diagnose" / "condition_usage_per_target_t900.csv", encoding="utf-8-sig")
     assert len(frame) == 8
+
+
+def test_cli_build_self_reference_dataset_runs(tmp_path, capsys):
+    from synthetic_artifacts import build_artifacts
+
+    from acceleration_forecasting_v2.datasets.prepare import prepare_datasets
+
+    artifacts, dataset = tmp_path / "artifacts", tmp_path / "dataset"
+    build_artifacts(artifacts, n_datasets=12, months=22, seed=0)
+    prepare_datasets(artifacts, dataset, device="cpu")
+
+    code, result = _run(capsys, "build-self-reference-dataset", "--source-dataset-dir", dataset,
+                        "--output-dataset-dir", tmp_path / "dataset_self_reference")
+    assert code == 0
+    assert set(result["counts"]) == {"model_train", "model_validation", "inference"}
+    assert (tmp_path / "dataset_self_reference" / "model_validation" / "guide_values.npy").is_file()
