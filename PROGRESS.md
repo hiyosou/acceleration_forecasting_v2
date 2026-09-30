@@ -950,3 +950,53 @@ context(attentionが集めた文脈ベクトル)の大きさが明確に"縮む"
 
 - 判定: GO。生成モジュール改善の焦点が、「U-Net全体」から「出口に近いブロック
   (dec12)での条件反映の経路」へとさらに絞り込まれた。
+
+## [2026-09-30] FiLM(condition_fusion由来のscale/shift)の内訳を追加、実データで実行 — 決定的な発見
+
+前項の「dec12付近でcontextが目減りする」という発見を、実際にU-Netの特徴マップへ適用される
+FiLM変調(`ConditionalBlock`のscale/shift、`condition_fusion`の最終出力)そのものまで
+追いかけて確認した。`models/reference_modulated_unet.py`の`ConditionalBlock`に
+`last_scale_norm`/`last_shift_norm`(既存の`last_attention`/`last_context_norm`と同じ
+診断用の副作用、forwardの計算・出力は無変更)を追加し、`block_breakdown_t{timestep}.csv`に
+`normal_scale_norm`/`self_target_scale_norm`/`normal_shift_norm`/`self_target_shift_norm`
+列を追加した。テスト7件追加、`.venv/Scripts/python.exe -m pytest tests/ -q`:
+222 passed(既存215+新規7)。実データ(epsilon・v_prediction両checkpoint、t=900)で実行した。
+
+### 結果: normal→self_targetでの変化量(context vs FiLM scale/shift、代表ブロック)
+
+| ブロック | context_norm変化(相対) | scale_norm変化(相対) | shift_norm変化(相対) |
+|---|---|---|---|
+| mid3-2(epsilon) | +0.040(**+8.7%**) | +0.0047(+0.036%) | +0.0020(+0.019%) |
+| mid3-1(v_prediction) | +0.050(**+11.3%**) | -0.083(-0.78%) | -0.056(-0.67%) |
+| dec12-2(epsilon) | -0.052(**-8.3%**) | -0.0086(-0.24%) | -0.0062(-0.22%) |
+| enc12-2(v_prediction) | -0.073(**-12.6%**) | -0.017(-0.25%) | -0.0080(-0.17%) |
+
+**全10ブロック・両checkpointで一貫して同じ傾向**: contextの変化(数%〜10%強)に対し、
+scale/shift(実際にU-Netへ加わる変調そのもの)の変化は**その1/10〜1/300程度**しかない
+(ほぼ0.02〜1%、実質ノイズ水準)。contextが最も大きく変化するmid3ブロックでも、
+scale/shiftの変化は他のブロックと同程度にごくわずかで、「contextの変化が大きいところほど
+scale/shiftも大きく変わる」という比例関係すら見られない。
+
+### 解釈(決定的)
+
+**attentionが集めた文脈(context)は確かにnormal/self_targetで変化するが、それを実際の
+FiLM変調(scale/shift)に変換する`condition_fusion`(RATD条件再構成MLP)と`film`
+(Linear層)の段階で、その変化がほぼ完全に吸収されて消えている。** これは前項までの
+一連の発見(attentionは正しく反応する→しかし出力に反映されない→contextはmid3で
+増えるがdec12にかけて目減りする)の、最終的な所在確認である: **ボトルネックは
+attention機構ではなく、`condition_fusion`/`film`という、contextを最終的な変調量に
+変換する小さなMLP/Linear層が、guide由来の変動にほぼ反応しないよう学習されてしまって
+いること**にある。
+
+実運用データでのguideは弱い・ノイズの多い信号であるため、学習中「guideの変動に応じて
+変調を大きく変える」ことにメリットがほとんど無く、`condition_fusion`/`film`はguide由来の
+入力成分を実質無視する方向に収束したと考えられる。これは推論時に人為的に強い信号
+(自分自身の正解)を与えても、この「無視する」という学習済みの振る舞いがそのまま
+働いてしまうことと整合する。
+
+- 判定: GO。**生成モジュール改善の対象が、`ReferenceModulatedAttention`の
+  `condition_fusion`(および`ConditionalBlock`の`film`)という、具体的な2つの小さな
+  レイヤーにまで絞り込まれた。** 次の一手としては、(a)これらの層に補助損失
+  (guide由来の変化に応じて出力が変わることを直接促す正則化)を加えて再学習する、
+  (b)`condition_fusion`の構造自体(現状は単純な2層MLP)を、guideの変動により敏感に
+  反応できる形に変更する、などが候補になる。
