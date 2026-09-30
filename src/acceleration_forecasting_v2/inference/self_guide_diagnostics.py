@@ -2,8 +2,16 @@
 
 既に学習済みのcheckpointに対し、**再学習なしで**guideの入力を「正しいまま(normal)」
 「入れ替え(shuffled、別dataset_idの他レコードのguide)」「無効化(disabled、
-guide_mask/retrieval_maskをゼロ)」の3通りに変えて出力を比較し、
-学習済みモデルが実際にguideの情報を予測に反映しているかを診断する。
+guide_mask/retrieval_maskをゼロ)」「自分自身の正解に差し替え(self_target、
+理想的な参照系列を与えたら今の実運用モデルはどこまで改善するか)」の4通りに変えて
+出力を比較し、学習済みモデルが実際にguideの情報を予測に反映しているかを診断する。
+
+`self_target`は`datasets.self_reference.build_self_reference_dataset`(guideを
+自分自身の正解に固定して**再学習する**上限性能測定)とは異なり、**再学習は一切行わず**、
+実際の検索結果で学習済みの既存モデルに、推論時だけ理想的なguideを与える。
+「モデルはguideを使う能力自体はあるが、実際の検索結果ではその能力を引き出せていない」
+という仮説に対し、「能力を引き出す情報さえ与えれば、今のモデルのままでも改善するか」を
+確認する(=検索側ではなく生成側の改善余地を切り分けるための診断)。
 
 `SELF_RETRIEVAL_CHECK.md`(検索の配管の検証)とは対象が異なる: こちらは
 「学習済みモデルがguide入力を使っているか」というモデル挙動の検証。
@@ -91,6 +99,53 @@ def _apply_shuffled_guides(batch):
     return shuffled
 
 
+def _build_self_target_batch(dataset, batch, current_values):
+    """既存のbatch(実際の検索結果によるguide)から、guideを**そのレコード自身の正解**に
+    差し替えたbatchを作る(再学習なし、推論時のみ)。
+
+    `datasets.self_reference._self_reference_arrays`と同じ規約: TOP_K=3スロットのうち
+    **1スロットだけ**に自分自身の正解を入れ、残り2スロットは無効(mask=0)のままにする。
+
+    guide_valuesはcondition_norm(history/guideと同じ正規化統計)で正規化する必要がある
+    ——targetはtarget_normで正規化されているため、一度物理値に戻してから
+    condition_normで正規化し直す(単純にtargetをそのまま流用できない)。
+    """
+    target, mask = batch["target"], batch["target_mask"]
+    device = target.device
+    physical_target = dataset.denormalize_target(target.detach().cpu().numpy())
+    mask_np = mask.detach().cpu().numpy()
+    valid = mask_np > 0
+
+    guide_values_physical = np.where(valid, physical_target, 0.0)
+    guide_values_normalized = dataset.condition_norm.normalize(guide_values_physical)
+    guide_values_normalized = np.nan_to_num(guide_values_normalized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    delta_physical = np.where(valid, physical_target - np.asarray(current_values, dtype=np.float32)[:, None], 0.0)
+    delta_normalized = np.nan_to_num(
+        delta_physical / dataset.condition_norm.std, nan=0.0, posinf=0.0, neginf=0.0
+    ).astype(np.float32)
+
+    batch_size, months = physical_target.shape
+    guide_values = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_masks = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_deltas = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_similarities = np.zeros((batch_size, 3), dtype=np.float32)
+    retrieval_masks = np.zeros((batch_size, 3), dtype=np.float32)
+    guide_values[:, 0] = guide_values_normalized
+    guide_masks[:, 0] = valid.astype(np.float32)
+    guide_deltas[:, 0] = delta_normalized
+    guide_similarities[:, 0] = 1.0
+    retrieval_masks[:, 0] = 1.0
+
+    self_target = dict(batch)
+    self_target["guide_values"] = torch.from_numpy(guide_values).to(device)
+    self_target["guide_mask"] = torch.from_numpy(guide_masks).to(device)
+    self_target["guide_deltas"] = torch.from_numpy(guide_deltas).to(device)
+    self_target["guide_similarities"] = torch.from_numpy(guide_similarities).to(device)
+    self_target["retrieval_mask"] = torch.from_numpy(retrieval_masks).to(device)
+    return self_target
+
+
 def _per_record_attention_ranks(model):
     """`model.reference_blocks`の`last_attention`(batch,heads,length,36)から、
     `diagnostic_stats()`のバッチ次元までの平均化を経る前の**レコードごとの真の値**を計算する。
@@ -143,6 +198,7 @@ def _masked_output_l1(output_a, output_b, mask):
 def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep, device):
     model = process.model
     alpha = process.alpha_bars[int(timestep)]
+    current_values = metadata["current_acc_z_max"].to_numpy(dtype=np.float32)
     rows = []
     for batch in loader:
         batch = {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in batch.items()}
@@ -154,13 +210,18 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
 
         shuffled_batch = _apply_shuffled_guides(batch)
         disabled_batch = _disable_guide(batch)
+        self_target_batch = _build_self_target_batch(dataset, batch, current_values[positions])
 
         with torch.inference_mode():
             output_normal = model(noisy, timesteps, batch)
-            # attentionの内部状態はnormalフォワード直後(次のforwardで上書きされる前)にのみ読む。
+            # attentionの内部状態はforward直後(次のforwardで上書きされる前)にのみ読む。
             attention_ranks = _per_record_attention_ranks(model)
             reference_context_norm = _reference_context_norm(model)
             clean_normal, _ = process.model_output_to_x0_epsilon(noisy, output_normal, alpha)
+
+            output_self_target = model(noisy, timesteps, self_target_batch)
+            self_target_attention_ranks = _per_record_attention_ranks(model)
+            clean_self_target, _ = process.model_output_to_x0_epsilon(noisy, output_self_target, alpha)
 
             output_shuffled = model(noisy, timesteps, shuffled_batch)
             clean_shuffled, _ = process.model_output_to_x0_epsilon(noisy, output_shuffled, alpha)
@@ -169,12 +230,16 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
             clean_disabled, _ = process.model_output_to_x0_epsilon(noisy, output_disabled, alpha)
 
         normal_mae = _physical_mae(dataset, clean_normal, target, mask)
+        self_target_mae = _physical_mae(dataset, clean_self_target, target, mask)
         shuffled_mae = _physical_mae(dataset, clean_shuffled, target, mask)
         disabled_mae = _physical_mae(dataset, clean_disabled, target, mask)
         l1_shuffled = _masked_output_l1(output_normal, output_shuffled, mask)
         l1_disabled = _masked_output_l1(output_normal, output_disabled, mask)
+        l1_self_target = _masked_output_l1(output_normal, output_self_target, mask)
         ranks = (attention_ranks.detach().cpu().numpy() if attention_ranks is not None
                  else np.full((target.shape[0], 3), np.nan))
+        self_target_ranks = (self_target_attention_ranks.detach().cpu().numpy()
+                             if self_target_attention_ranks is not None else np.full((target.shape[0], 3), np.nan))
 
         trend_ids = metadata["trend_id"].to_numpy()[positions]
         dataset_ids = metadata["dataset_id"].to_numpy()[positions]
@@ -182,13 +247,19 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
             rows.append({
                 "trend_id": trend_ids[row], "dataset_id": dataset_ids[row],
                 "normal_MAE": float(normal_mae[row]), "shuffled_MAE": float(shuffled_mae[row]),
-                "disabled_MAE": float(disabled_mae[row]),
+                "disabled_MAE": float(disabled_mae[row]), "self_target_MAE": float(self_target_mae[row]),
                 "guide_advantage_vs_shuffled": float(shuffled_mae[row] - normal_mae[row]),
                 "guide_advantage_vs_disabled": float(disabled_mae[row] - normal_mae[row]),
+                # 正: 完璧なguide(自分自身の正解)を与えると実際のguideより改善する。
+                "self_target_improvement": float(normal_mae[row] - self_target_mae[row]),
                 "normal_vs_shuffled_output_L1": float(l1_shuffled[row]),
                 "normal_vs_disabled_output_L1": float(l1_disabled[row]),
+                "normal_vs_self_target_output_L1": float(l1_self_target[row]),
                 "attention_rank_1": float(ranks[row, 0]), "attention_rank_2": float(ranks[row, 1]),
                 "attention_rank_3": float(ranks[row, 2]),
+                "self_target_attention_rank_1": float(self_target_ranks[row, 0]),
+                "self_target_attention_rank_2": float(self_target_ranks[row, 1]),
+                "self_target_attention_rank_3": float(self_target_ranks[row, 2]),
                 "reference_context_norm": float(reference_context_norm),
             })
     return pd.DataFrame(rows)
@@ -208,12 +279,18 @@ def _summarize(frame, timestep, config):
         "normal_MAE_mean": float(frame["normal_MAE"].mean()),
         "shuffled_MAE_mean": float(frame["shuffled_MAE"].mean()),
         "disabled_MAE_mean": float(frame["disabled_MAE"].mean()),
+        "self_target_MAE_mean": float(frame["self_target_MAE"].mean()),
         "guide_advantage_vs_shuffled": _percentile_stats(frame["guide_advantage_vs_shuffled"].to_numpy()),
         "guide_advantage_vs_disabled": _percentile_stats(frame["guide_advantage_vs_disabled"].to_numpy()),
+        "self_target_improvement": _percentile_stats(frame["self_target_improvement"].to_numpy()),
         "normal_vs_shuffled_output_L1_mean": float(frame["normal_vs_shuffled_output_L1"].mean()),
         "normal_vs_disabled_output_L1_mean": float(frame["normal_vs_disabled_output_L1"].mean()),
+        "normal_vs_self_target_output_L1_mean": float(frame["normal_vs_self_target_output_L1"].mean()),
         "reference_context_norm_mean": float(frame["reference_context_norm"].mean()),
         "attention_rank_mean": [float(frame[f"attention_rank_{index}"].mean()) for index in (1, 2, 3)],
+        "self_target_attention_rank_mean": [
+            float(frame[f"self_target_attention_rank_{index}"].mean()) for index in (1, 2, 3)
+        ],
     }
 
 

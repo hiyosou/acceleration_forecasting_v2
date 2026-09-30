@@ -21,10 +21,13 @@ from acceleration_forecasting_v2.training.train import train
 
 
 def _raw_split_with_datasets(n, *, seed=0, n_datasets=4, **kwargs):
-    """`test_training._raw_split`にdataset_id列を追加する(shuffled相手選びに必要)。"""
+    """`test_training._raw_split`にdataset_id列・current_acc_z_max列を追加する
+    (それぞれshuffled相手選び・self_target構築に必要)。
+    """
     raw = _raw_split(n, seed=seed, **kwargs)
     metadata = raw.metadata.copy()
     metadata["dataset_id"] = [f"seg{index % n_datasets:02d}" for index in range(n)]
+    metadata["current_acc_z_max"] = raw.arrays["history_values"][:, -1].astype(np.float32)
     return replace(raw, metadata=metadata)
 
 
@@ -89,10 +92,12 @@ def test_output_shape_and_columns_match_the_split_record_count(trained, tmp_path
     frame = pd.read_csv(tmp_path / "out" / "condition_usage_per_target_t900.csv", encoding="utf-8-sig")
     assert len(frame) == 16
     expected_columns = {
-        "trend_id", "dataset_id", "normal_MAE", "shuffled_MAE", "disabled_MAE",
-        "guide_advantage_vs_shuffled", "guide_advantage_vs_disabled",
-        "normal_vs_shuffled_output_L1", "normal_vs_disabled_output_L1",
-        "attention_rank_1", "attention_rank_2", "attention_rank_3", "reference_context_norm",
+        "trend_id", "dataset_id", "normal_MAE", "shuffled_MAE", "disabled_MAE", "self_target_MAE",
+        "guide_advantage_vs_shuffled", "guide_advantage_vs_disabled", "self_target_improvement",
+        "normal_vs_shuffled_output_L1", "normal_vs_disabled_output_L1", "normal_vs_self_target_output_L1",
+        "attention_rank_1", "attention_rank_2", "attention_rank_3",
+        "self_target_attention_rank_1", "self_target_attention_rank_2", "self_target_attention_rank_3",
+        "reference_context_norm",
     }
     assert expected_columns <= set(frame.columns)
     assert np.isfinite(frame[list(expected_columns - {"trend_id", "dataset_id"})].to_numpy()).all()
@@ -183,10 +188,13 @@ def test_a_model_that_ignores_guide_shows_zero_advantage(tmp_path_factory, tmp_p
     frame = pd.read_csv(tmp_path / "out" / "condition_usage_per_target_t900.csv", encoding="utf-8-sig")
     assert (frame["normal_vs_shuffled_output_L1"] == 0.0).all()
     assert (frame["normal_vs_disabled_output_L1"] == 0.0).all()
+    assert (frame["normal_vs_self_target_output_L1"] == 0.0).all()
     assert (frame["guide_advantage_vs_shuffled"] == 0.0).all()
     assert (frame["guide_advantage_vs_disabled"] == 0.0).all()
+    assert (frame["self_target_improvement"] == 0.0).all()
     summary = result["results"]["900"]
     assert summary["guide_advantage_vs_disabled"]["mean"] == pytest.approx(0.0)
+    assert summary["self_target_improvement"]["mean"] == pytest.approx(0.0)
 
 
 def test_a_model_that_only_uses_guide_shows_a_large_disabled_gap(tmp_path_factory, tmp_path):
@@ -202,4 +210,31 @@ def test_a_model_that_only_uses_guide_shows_a_large_disabled_gap(tmp_path_factor
     assert summary["normal_vs_disabled_output_L1_mean"] > 0.5
     # attention_rank/reference_context_normはRMA専用のためNaN(ダミーモデルにはreference_blocksが無い)。
     assert frame["attention_rank_1"].isna().all()
+    assert frame["self_target_attention_rank_1"].isna().all()
     assert frame["reference_context_norm"].isna().all()
+    # self_targetのguideの中身(条件正規化した自分自身の正解)は合成データのnormal guide
+    # (target+微小ノイズ)と異なる値になるため、guideをそのまま出力するこのダミーモデルでは
+    # normalとself_targetで出力が変わるはず(=self_targetが正しく別の入力として渡っている証拠)。
+    assert (frame["normal_vs_self_target_output_L1"] > 0.0).all()
+
+
+def test_self_target_batch_fills_only_slot_zero_with_condition_normalized_target(tmp_path_factory, tmp_path):
+    from acceleration_forecasting_v2.inference.self_guide_diagnostics import _build_self_target_batch
+
+    dataset_dir = _dataset_dir_for_dummy_models(tmp_path_factory)
+    from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
+
+    dataset = ForecastDatasetV2(dataset_dir / "model_validation", dataset_dir, include_targets=True)
+    batch = {key: (value.unsqueeze(0) if torch.is_tensor(value) else value) for key, value in dataset[0].items()}
+    current_values = np.array([1.0], dtype=np.float32)
+
+    self_target = _build_self_target_batch(dataset, batch, current_values)
+    expected_guide_values = dataset.condition_norm.normalize(dataset.denormalize_target(batch["target"].numpy()))
+    np.testing.assert_allclose(self_target["guide_values"][:, 0].numpy(), expected_guide_values, atol=1e-4)
+    np.testing.assert_array_equal(self_target["guide_mask"][:, 0].numpy(), batch["target_mask"].numpy())
+    assert self_target["guide_mask"][:, 1:].sum() == 0
+    assert self_target["retrieval_mask"][0, 0] == 1.0
+    assert self_target["retrieval_mask"][0, 1:].sum() == 0
+    assert self_target["guide_similarities"][0, 0] == 1.0
+    # guide以外のフィールド(history_values等)は変更しない。
+    assert torch.equal(self_target["history_values"], batch["history_values"])
