@@ -134,3 +134,50 @@ def test_diagnostic_stats_available_after_forward_pass():
     stats = model.diagnostic_stats()
     assert "reference_context_norm" in stats
     assert "attention_rank_1" in stats
+
+
+# --- context_residual(RATD融合への直接残差接続、2026-09-30追加) -------------------
+
+def test_context_residual_zero_initialized_at_construction():
+    model = ReferenceModulatedUNetV2()  # 既定はratd_condition_reconstruction
+    for block in model.reference_blocks:
+        attention = block.reference_attention
+        assert hasattr(attention, "context_residual")
+        assert torch.equal(attention.context_residual.weight,
+                           torch.zeros_like(attention.context_residual.weight))
+
+
+def test_context_residual_contributes_exactly_zero_at_init():
+    # bias無し・全ゼロ重みのため、どんな入力に対しても出力は厳密にゼロベクトルになる
+    # (「小さい」ではなく厳密にゼロであることの確認、検出力の直接証拠)。
+    model = ReferenceModulatedUNetV2()
+    attention = model.reference_blocks[0].reference_attention
+    inner = attention.heads * attention.head_dim
+    probe = torch.randn(4, inner)
+    output = attention.context_residual(probe)
+    assert torch.equal(output, torch.zeros(4, model.condition_dim))
+
+
+def test_context_residual_receives_nonzero_gradient_on_backward():
+    # 検出力の要: 実際に1回backwardした後、context_residual.weight.gradが
+    # None ではなく、かつ非ゼロであることを確認する(死んだ経路ではなく
+    # 計算グラフに正しく接続されていることの証明)。
+    model = ReferenceModulatedUNetV2()
+    batch = _dummy_batch(batch_size=4)
+    output = model(torch.randn(4, 12), torch.randint(0, 1000, (4,)), batch)
+    output.sum().backward()
+    for block in model.reference_blocks:
+        weight_grad = block.reference_attention.context_residual.weight.grad
+        assert weight_grad is not None
+        assert (weight_grad.abs().sum() > 0).item()
+
+
+def test_residual_delta_fusion_has_no_context_residual_attribute():
+    # 最小限の変更であることの保証: residual_delta融合のモデルには
+    # context_residual属性自体が存在しない。
+    model = ReferenceModulatedUNetV2(
+        reference_similarity_enabled=True, reference_attention_mode="global",
+        reference_fusion_type="residual_delta",
+    )
+    for block in model.reference_blocks:
+        assert not hasattr(block.reference_attention, "context_residual")

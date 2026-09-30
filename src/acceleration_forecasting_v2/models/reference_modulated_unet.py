@@ -96,7 +96,23 @@ class ConditionalBlock(nn.Module):
 
 
 class ReferenceModulatedAttention(nn.Module):
-    """`models/reference_modulated_unet.py`の`ReferenceModulatedAttention`を無変更で移植。"""
+    """`models/reference_modulated_unet.py`の`ReferenceModulatedAttention`を出発点に、
+    `ratd_condition_reconstruction`融合に`context_residual`(guide由来のcontextから
+    output_conditionへの直接残差接続)を追加している(2026-09-30、診断で判明した
+    ボトルネックへの対応)。
+
+    診断(`inference/self_guide_diagnostics.py`のブロック単位・FiLM単位の内訳)により、
+    attentionが集めたcontextはブロックによって最大10%前後変化するのに対し、実際の
+    FiLM変調(scale/shift、`condition_fusion`の最終出力)はほぼ変化しない(相対変化
+    0.02〜1%程度)ことが分かった。既存の共有MLP(`condition_fusion`)は
+    `pooled_values`/`condition`(実運用では支配的な信号)と`pooled_context`(guide由来、
+    弱い信号)を混ぜて処理するため、学習中にguide由来の変動への感度がほぼ失われたと
+    考えられる。`context_residual`は、既存の代替融合方式`residual_delta`
+    (`output_condition = condition + self.condition_output(pooled_context)`)が
+    既に持つ「直接残差」の性質を、`condition_fusion`の共有MLPは維持したまま追加で
+    与えるもの(両方の利点を両立させる狙い)。ゼロ初期化のため、学習開始時点では
+    これまでと数値的に完全に同一の挙動になる。
+    """
 
     def __init__(self, channels, condition_dim=256, reference_dim=64, heads=8, head_dim=8,
                  use_similarity_bias=True, attention_mode="global", fusion_type="residual_delta"):
@@ -120,6 +136,8 @@ class ReferenceModulatedAttention(nn.Module):
                 nn.Linear(channels + condition_dim + inner, condition_dim), nn.SiLU(),
                 nn.Linear(condition_dim, condition_dim),
             )
+            self.context_residual = nn.Linear(inner, condition_dim, bias=False)
+            nn.init.zeros_(self.context_residual.weight)
         if self.use_similarity_bias:
             self.similarity_scale = nn.Parameter(torch.tensor(1.0))
         self.last_attention = None
@@ -169,7 +187,7 @@ class ReferenceModulatedAttention(nn.Module):
             pooled_values = values.mean(dim=-1)
             output_condition = self.condition_fusion(
                 torch.cat([pooled_values, condition, pooled_context], dim=-1)
-            )
+            ) + self.context_residual(pooled_context)
         else:
             output_condition = condition + self.condition_output(pooled_context)
         self.last_attention = weights.detach()
