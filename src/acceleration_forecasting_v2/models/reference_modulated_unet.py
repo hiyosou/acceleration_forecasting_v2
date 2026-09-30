@@ -67,7 +67,15 @@ class GuideEncoder12(nn.Module):
 
 
 class ConditionalBlock(nn.Module):
-    """`models/absolute_attention_unet.py`の`ConditionalBlock`(FiLM変調)を無変更で移植。"""
+    """`models/absolute_attention_unet.py`の`ConditionalBlock`(FiLM変調)を無変更で移植。
+
+    `last_scale_norm`/`last_shift_norm`は`ReferenceModulatedAttention`の
+    `last_attention`/`last_context_norm`と同じ診断用の副作用(forwardの計算自体には
+    影響しない)。直前1回のforward呼び出し分のFiLM出力(scale/shift)の大きさを
+    バッチ単位のスカラーとして保持し、guide条件診断(`inference/self_guide_diagnostics.py`)から
+    「attentionが集めた文脈が、実際にU-Netへ加える変調(FiLM)としてどれだけの大きさに
+    変換されているか」を覗けるようにする。
+    """
 
     def __init__(self, channels, dropout=0.1, condition_dim=256):
         super().__init__()
@@ -75,9 +83,13 @@ class ConditionalBlock(nn.Module):
         self.conv1, self.conv2 = nn.Conv1d(channels, channels, 3, padding=1), nn.Conv1d(channels, channels, 3, padding=1)
         self.film = nn.Linear(condition_dim, channels * 2)
         self.dropout = nn.Dropout(dropout)
+        self.last_scale_norm = None
+        self.last_shift_norm = None
 
     def forward(self, values, condition):
         scale, shift = self.film(condition).chunk(2, dim=-1)
+        self.last_scale_norm = scale.detach().norm(dim=-1).mean()
+        self.last_shift_norm = shift.detach().norm(dim=-1).mean()
         hidden = self.conv1(F.silu(self.norm1(values)))
         hidden = self.norm2(hidden) * (1 + scale[:, :, None]) + shift[:, :, None]
         return values + self.conv2(self.dropout(F.silu(hidden)))

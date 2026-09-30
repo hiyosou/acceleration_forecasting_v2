@@ -15,9 +15,12 @@ from acceleration_forecasting_v2.inference.self_guide_diagnostics import (
     _BLOCK_LABELS,
     _BlockStatsAccumulator,
     _combine_block_breakdown,
+    _combine_film_breakdown,
     _diagnose_with_process,
     _disable_guide,
+    _merge_breakdowns,
     _per_block_diagnostic_stats,
+    _per_block_film_stats,
     compute_shuffled_partner_indices,
     diagnose_guide_conditioning,
 )
@@ -115,6 +118,7 @@ def test_output_shape_and_columns_match_the_split_record_count(trained, tmp_path
         "block", "normal_context_norm", "self_target_context_norm",
         "normal_attention_rank_1", "normal_attention_rank_2", "normal_attention_rank_3",
         "self_target_attention_rank_1", "self_target_attention_rank_2", "self_target_attention_rank_3",
+        "normal_scale_norm", "self_target_scale_norm", "normal_shift_norm", "self_target_shift_norm",
     }
     assert expected_block_columns == set(block_frame.columns)
     assert np.isfinite(block_frame.drop(columns=["block"]).to_numpy()).all()
@@ -365,3 +369,90 @@ def test_block_breakdown_is_none_and_no_file_for_models_without_reference_blocks
                                     split="model_validation", timesteps=(900,), batch_size=4)
     assert result["block_breakdown"]["900"] is None
     assert not (tmp_path / "out" / "block_breakdown_t900.csv").is_file()
+
+
+# --- FiLM(condition_fusion由来のscale/shift)の内訳 ---------------------------------
+
+def test_per_block_film_stats_returns_empty_for_models_without_reference_blocks():
+    assert _per_block_film_stats(_GuideIgnoringModel()) == []
+    assert _per_block_film_stats(_GuideOnlyModel()) == []
+
+
+def test_per_block_film_stats_matches_labels_and_is_finite(trained):
+    from torch.utils.data import DataLoader
+
+    from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
+    from acceleration_forecasting_v2.inference.predict import load_process
+
+    dataset_dir, checkpoint = trained
+    process, _ = load_process(checkpoint, "cpu", use_ema=True)
+    model = process.model
+    model.eval()
+
+    dataset = ForecastDatasetV2(dataset_dir / "model_validation", dataset_dir, include_targets=True)
+    batch = next(iter(DataLoader(dataset, batch_size=4, shuffle=False)))
+    target = batch["target"]
+    alpha = process.alpha_bars[900]
+    noisy = alpha.sqrt() * target + (1 - alpha).sqrt() * torch.randn_like(target)
+    timesteps = torch.full((target.shape[0],), 900, dtype=torch.long)
+
+    with torch.inference_mode():
+        model(noisy, timesteps, batch)
+        per_block = _per_block_film_stats(model)
+
+    assert len(per_block) == 10
+    assert [entry["block"] for entry in per_block] == list(_BLOCK_LABELS)
+    values = np.array([[entry["scale_norm"], entry["shift_norm"]] for entry in per_block])
+    assert np.isfinite(values).all()
+    assert (values > 0).all()  # normは非負、実際のFiLM出力があれば通常0にはならない
+
+
+def test_combine_film_breakdown_keeps_each_blocks_values_distinct():
+    normal_rows = [
+        {"block": "a", "scale_norm": 1.0, "shift_norm": 0.1},
+        {"block": "b", "scale_norm": 5.0, "shift_norm": 0.5},
+    ]
+    self_target_rows = [
+        {"block": "a", "scale_norm": 2.0, "shift_norm": 0.2},
+        {"block": "b", "scale_norm": 6.0, "shift_norm": 0.6},
+    ]
+    combined = _combine_film_breakdown(normal_rows, self_target_rows)
+    assert [row["block"] for row in combined] == ["a", "b"]
+    assert combined[0]["normal_scale_norm"] == 1.0 and combined[0]["self_target_scale_norm"] == 2.0
+    assert combined[1]["normal_scale_norm"] == 5.0 and combined[1]["self_target_scale_norm"] == 6.0
+    assert combined[0]["self_target_scale_norm"] != combined[1]["self_target_scale_norm"]
+
+
+def test_combine_film_breakdown_returns_empty_if_either_side_is_empty():
+    row = [{"block": "a", "scale_norm": 1.0, "shift_norm": 0.1}]
+    assert _combine_film_breakdown([], row) == []
+    assert _combine_film_breakdown(row, []) == []
+
+
+def test_merge_breakdowns_adds_film_columns_without_dropping_attention_columns():
+    attention_breakdown = [
+        {"block": "a", "normal_context_norm": 1.0, "self_target_context_norm": 2.0},
+        {"block": "b", "normal_context_norm": 3.0, "self_target_context_norm": 4.0},
+    ]
+    film_breakdown = [
+        {"block": "a", "normal_scale_norm": 0.1, "self_target_scale_norm": 0.2},
+        {"block": "b", "normal_scale_norm": 0.3, "self_target_scale_norm": 0.4},
+    ]
+    merged = _merge_breakdowns(attention_breakdown, film_breakdown)
+    assert merged[0] == {
+        "block": "a", "normal_context_norm": 1.0, "self_target_context_norm": 2.0,
+        "normal_scale_norm": 0.1, "self_target_scale_norm": 0.2,
+    }
+    assert merged[1]["block"] == "b" and merged[1]["normal_scale_norm"] == 0.3
+
+
+def test_merge_breakdowns_returns_empty_when_attention_breakdown_is_empty():
+    assert _merge_breakdowns([], [{"block": "a", "normal_scale_norm": 0.1}]) == []
+
+
+def test_film_breakdown_is_absent_for_models_without_reference_blocks(tmp_path_factory, tmp_path):
+    dataset_dir = _dataset_dir_for_dummy_models(tmp_path_factory)
+    process = DiffusionProcess(_GuideOnlyModel(), steps=1000, prediction_type="epsilon")
+    result = _diagnose_with_process(process, {"prediction_type": "epsilon"}, dataset_dir, tmp_path / "out",
+                                    split="model_validation", timesteps=(900,), batch_size=4)
+    assert result["block_breakdown"]["900"] is None

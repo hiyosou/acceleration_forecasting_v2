@@ -217,13 +217,16 @@ def _per_block_diagnostic_stats(model) -> list[dict]:
 class _BlockStatsAccumulator:
     """DataLoaderの複数バッチにまたがる、バッチサイズ加重平均のブロック別統計量。
 
-    各バッチの`_per_block_diagnostic_stats`の戻り値(バッチ内で既に平均済みのスカラー)を
-    `weight=batch_size`で加重平均することで、split全体での真の(レコード単位の)平均になる。
+    各バッチの`_per_block_diagnostic_stats`(または`_per_block_film_stats`)の戻り値
+    (バッチ内で既に平均済みのスカラー)を`weight=batch_size`で加重平均することで、
+    split全体での真の(レコード単位の)平均になる。`metric_keys`を変えることで
+    attention/context用・FiLM用のどちらの集計にも使い回せる。
     """
 
-    _METRIC_KEYS = ("context_norm", "attention_rank_1", "attention_rank_2", "attention_rank_3")
+    _DEFAULT_METRIC_KEYS = ("context_norm", "attention_rank_1", "attention_rank_2", "attention_rank_3")
 
-    def __init__(self):
+    def __init__(self, metric_keys=None):
+        self._metric_keys = tuple(metric_keys) if metric_keys is not None else self._DEFAULT_METRIC_KEYS
         self._order: list[str] = []
         self._weighted_sums: dict[str, dict[str, float]] = {}
         self._weights: dict[str, float] = {}
@@ -233,10 +236,10 @@ class _BlockStatsAccumulator:
             label = entry["block"]
             if label not in self._weights:
                 self._order.append(label)
-                self._weighted_sums[label] = {key: 0.0 for key in self._METRIC_KEYS}
+                self._weighted_sums[label] = {key: 0.0 for key in self._metric_keys}
                 self._weights[label] = 0.0
             self._weights[label] += weight
-            for key in self._METRIC_KEYS:
+            for key in self._metric_keys:
                 self._weighted_sums[label][key] += entry[key] * weight
 
     def result(self) -> list[dict]:
@@ -244,7 +247,7 @@ class _BlockStatsAccumulator:
         for label in self._order:
             total_weight = self._weights[label]
             row = {"block": label}
-            for key in self._METRIC_KEYS:
+            for key in self._metric_keys:
                 row[key] = self._weighted_sums[label][key] / total_weight if total_weight else float("nan")
             rows.append(row)
         return rows
@@ -273,6 +276,61 @@ def _combine_block_breakdown(normal_rows: list[dict], self_target_rows: list[dic
     return combined
 
 
+def _per_block_film_stats(model) -> list[dict]:
+    """各`reference_blocks`のFiLM(scale/shift)の大きさをブロックごとに返す(平均で潰さない)。
+
+    `block.residual`(`ConditionalBlock`)が保持する`last_scale_norm`/`last_shift_norm`
+    (直前1回のforward分、バッチ単位のスカラー)を読む。`_per_block_diagnostic_stats`と
+    同じ場所・同じタイミングで呼ぶこと。`reference_blocks`を持たないモデルには`[]`を返す。
+    """
+    blocks = getattr(model, "reference_blocks", None)
+    if not blocks:
+        return []
+    labels = _BLOCK_LABELS if len(blocks) == len(_BLOCK_LABELS) else [f"block-{index}" for index in range(len(blocks))]
+    stats = []
+    for label, block in zip(labels, blocks):
+        residual = block.residual
+        scale_norm = float(residual.last_scale_norm) if residual.last_scale_norm is not None else float("nan")
+        shift_norm = float(residual.last_shift_norm) if residual.last_shift_norm is not None else float("nan")
+        stats.append({"block": label, "scale_norm": scale_norm, "shift_norm": shift_norm})
+    return stats
+
+
+def _combine_film_breakdown(normal_rows: list[dict], self_target_rows: list[dict]) -> list[dict]:
+    """normal/self_targetのFiLM(scale/shift)統計を、blockをキーに横持ちへ結合する。"""
+    if not normal_rows or not self_target_rows:
+        return []
+    self_target_by_block = {row["block"]: row for row in self_target_rows}
+    combined = []
+    for row in normal_rows:
+        label = row["block"]
+        partner = self_target_by_block.get(label, {})
+        combined.append({
+            "block": label,
+            "normal_scale_norm": row["scale_norm"],
+            "self_target_scale_norm": partner.get("scale_norm", float("nan")),
+            "normal_shift_norm": row["shift_norm"],
+            "self_target_shift_norm": partner.get("shift_norm", float("nan")),
+        })
+    return combined
+
+
+def _merge_breakdowns(attention_breakdown: list[dict], film_breakdown: list[dict]) -> list[dict]:
+    """block列をキーに、attention/context側の内訳とFiLM側の内訳を1ブロック1行にまとめる。"""
+    if not attention_breakdown:
+        return []
+    film_by_block = {row["block"]: row for row in film_breakdown}
+    merged = []
+    for row in attention_breakdown:
+        entry = dict(row)
+        partner = film_by_block.get(row["block"], {})
+        for key, value in partner.items():
+            if key != "block":
+                entry[key] = value
+        merged.append(entry)
+    return merged
+
+
 def _physical_mae(dataset, predicted_clean_normalized, target_normalized, mask):
     physical_prediction = dataset.physical_prediction(
         predicted_clean_normalized.detach().cpu().numpy(), bounds=(PHYSICAL_MIN, PHYSICAL_MAX)
@@ -297,6 +355,8 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
     rows = []
     normal_block_accumulator = _BlockStatsAccumulator()
     self_target_block_accumulator = _BlockStatsAccumulator()
+    normal_film_accumulator = _BlockStatsAccumulator(metric_keys=("scale_norm", "shift_norm"))
+    self_target_film_accumulator = _BlockStatsAccumulator(metric_keys=("scale_norm", "shift_norm"))
     for batch in loader:
         batch = {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in batch.items()}
         positions = batch["index"].cpu().numpy()
@@ -315,11 +375,13 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
             attention_ranks = _per_record_attention_ranks(model)
             reference_context_norm = _reference_context_norm(model)
             normal_block_accumulator.add(_per_block_diagnostic_stats(model), weight=target.shape[0])
+            normal_film_accumulator.add(_per_block_film_stats(model), weight=target.shape[0])
             clean_normal, _ = process.model_output_to_x0_epsilon(noisy, output_normal, alpha)
 
             output_self_target = model(noisy, timesteps, self_target_batch)
             self_target_attention_ranks = _per_record_attention_ranks(model)
             self_target_block_accumulator.add(_per_block_diagnostic_stats(model), weight=target.shape[0])
+            self_target_film_accumulator.add(_per_block_film_stats(model), weight=target.shape[0])
             clean_self_target, _ = process.model_output_to_x0_epsilon(noisy, output_self_target, alpha)
 
             output_shuffled = model(noisy, timesteps, shuffled_batch)
@@ -361,7 +423,9 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
                 "self_target_attention_rank_3": float(self_target_ranks[row, 2]),
                 "reference_context_norm": float(reference_context_norm),
             })
-    block_breakdown = _combine_block_breakdown(normal_block_accumulator.result(), self_target_block_accumulator.result())
+    attention_breakdown = _combine_block_breakdown(normal_block_accumulator.result(), self_target_block_accumulator.result())
+    film_breakdown = _combine_film_breakdown(normal_film_accumulator.result(), self_target_film_accumulator.result())
+    block_breakdown = _merge_breakdowns(attention_breakdown, film_breakdown)
     return pd.DataFrame(rows), block_breakdown
 
 
