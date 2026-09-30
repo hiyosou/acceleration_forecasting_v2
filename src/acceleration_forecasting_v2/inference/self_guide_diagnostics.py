@@ -178,6 +178,101 @@ def _reference_context_norm(model):
     return float(stats()["reference_context_norm"])
 
 
+_BLOCK_LABELS = (
+    "enc12-1", "enc12-2", "enc6-1", "enc6-2", "mid3-1", "mid3-2",
+    "dec6-1", "dec6-2", "dec12-1", "dec12-2",
+)
+
+
+def _per_block_diagnostic_stats(model) -> list[dict]:
+    """`model.diagnostic_stats()`と同じ計算(reshape→sum(dim=-1).mean(dim=(0,1,2)))を、
+    ブロック間で平均せずブロックごとに返す(U-Netのどの深さでnormal/self_targetの反応が
+    違うかを見るための内訳)。直前1回のforward呼び出し分の状態を読むだけなので、次のforwardで
+    上書きされる前に呼ぶこと。`reference_blocks`を持たないモデル(テスト用ダミーモデル等)には
+    `[]`を返す。
+    """
+    blocks = getattr(model, "reference_blocks", None)
+    if not blocks:
+        return []
+    labels = _BLOCK_LABELS if len(blocks) == len(_BLOCK_LABELS) else [f"block-{index}" for index in range(len(blocks))]
+    stats = []
+    for label, block in zip(labels, blocks):
+        attention = block.reference_attention
+        context_norm = float(attention.last_context_norm) if attention.last_context_norm is not None else float("nan")
+        if attention.last_attention is not None:
+            weights = attention.last_attention.reshape(
+                attention.last_attention.shape[0], attention.last_attention.shape[1],
+                attention.last_attention.shape[2], 3, 12,
+            ).sum(dim=-1).mean(dim=(0, 1, 2))
+            rank = [float(value) for value in weights.tolist()]
+        else:
+            rank = [float("nan")] * 3
+        stats.append({
+            "block": label, "context_norm": context_norm,
+            "attention_rank_1": rank[0], "attention_rank_2": rank[1], "attention_rank_3": rank[2],
+        })
+    return stats
+
+
+class _BlockStatsAccumulator:
+    """DataLoaderの複数バッチにまたがる、バッチサイズ加重平均のブロック別統計量。
+
+    各バッチの`_per_block_diagnostic_stats`の戻り値(バッチ内で既に平均済みのスカラー)を
+    `weight=batch_size`で加重平均することで、split全体での真の(レコード単位の)平均になる。
+    """
+
+    _METRIC_KEYS = ("context_norm", "attention_rank_1", "attention_rank_2", "attention_rank_3")
+
+    def __init__(self):
+        self._order: list[str] = []
+        self._weighted_sums: dict[str, dict[str, float]] = {}
+        self._weights: dict[str, float] = {}
+
+    def add(self, per_block_stats: list[dict], weight: int) -> None:
+        for entry in per_block_stats:
+            label = entry["block"]
+            if label not in self._weights:
+                self._order.append(label)
+                self._weighted_sums[label] = {key: 0.0 for key in self._METRIC_KEYS}
+                self._weights[label] = 0.0
+            self._weights[label] += weight
+            for key in self._METRIC_KEYS:
+                self._weighted_sums[label][key] += entry[key] * weight
+
+    def result(self) -> list[dict]:
+        rows = []
+        for label in self._order:
+            total_weight = self._weights[label]
+            row = {"block": label}
+            for key in self._METRIC_KEYS:
+                row[key] = self._weighted_sums[label][key] / total_weight if total_weight else float("nan")
+            rows.append(row)
+        return rows
+
+
+def _combine_block_breakdown(normal_rows: list[dict], self_target_rows: list[dict]) -> list[dict]:
+    """normal/self_targetのブロック別統計を、blockをキーに横持ち(1ブロック1行)へ結合する。"""
+    if not normal_rows or not self_target_rows:
+        return []
+    self_target_by_block = {row["block"]: row for row in self_target_rows}
+    combined = []
+    for row in normal_rows:
+        label = row["block"]
+        partner = self_target_by_block.get(label, {})
+        combined.append({
+            "block": label,
+            "normal_context_norm": row["context_norm"],
+            "self_target_context_norm": partner.get("context_norm", float("nan")),
+            "normal_attention_rank_1": row["attention_rank_1"],
+            "normal_attention_rank_2": row["attention_rank_2"],
+            "normal_attention_rank_3": row["attention_rank_3"],
+            "self_target_attention_rank_1": partner.get("attention_rank_1", float("nan")),
+            "self_target_attention_rank_2": partner.get("attention_rank_2", float("nan")),
+            "self_target_attention_rank_3": partner.get("attention_rank_3", float("nan")),
+        })
+    return combined
+
+
 def _physical_mae(dataset, predicted_clean_normalized, target_normalized, mask):
     physical_prediction = dataset.physical_prediction(
         predicted_clean_normalized.detach().cpu().numpy(), bounds=(PHYSICAL_MIN, PHYSICAL_MAX)
@@ -200,6 +295,8 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
     alpha = process.alpha_bars[int(timestep)]
     current_values = metadata["current_acc_z_max"].to_numpy(dtype=np.float32)
     rows = []
+    normal_block_accumulator = _BlockStatsAccumulator()
+    self_target_block_accumulator = _BlockStatsAccumulator()
     for batch in loader:
         batch = {key: (value.to(device) if torch.is_tensor(value) else value) for key, value in batch.items()}
         positions = batch["index"].cpu().numpy()
@@ -217,10 +314,12 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
             # attentionの内部状態はforward直後(次のforwardで上書きされる前)にのみ読む。
             attention_ranks = _per_record_attention_ranks(model)
             reference_context_norm = _reference_context_norm(model)
+            normal_block_accumulator.add(_per_block_diagnostic_stats(model), weight=target.shape[0])
             clean_normal, _ = process.model_output_to_x0_epsilon(noisy, output_normal, alpha)
 
             output_self_target = model(noisy, timesteps, self_target_batch)
             self_target_attention_ranks = _per_record_attention_ranks(model)
+            self_target_block_accumulator.add(_per_block_diagnostic_stats(model), weight=target.shape[0])
             clean_self_target, _ = process.model_output_to_x0_epsilon(noisy, output_self_target, alpha)
 
             output_shuffled = model(noisy, timesteps, shuffled_batch)
@@ -262,7 +361,8 @@ def _run_one_timestep(process, loader, dataset, metadata, noise_table, timestep,
                 "self_target_attention_rank_3": float(self_target_ranks[row, 2]),
                 "reference_context_norm": float(reference_context_norm),
             })
-    return pd.DataFrame(rows)
+    block_breakdown = _combine_block_breakdown(normal_block_accumulator.result(), self_target_block_accumulator.result())
+    return pd.DataFrame(rows), block_breakdown
 
 
 def _percentile_stats(values):
@@ -323,8 +423,9 @@ def _diagnose_with_process(process, config, dataset_dir, output_dir, *, split="m
     ])
 
     results = {}
+    block_breakdown_paths = {}
     for timestep in timesteps:
-        frame = _run_one_timestep(process, loader, dataset, metadata, noise_table, int(timestep), device)
+        frame, block_breakdown = _run_one_timestep(process, loader, dataset, metadata, noise_table, int(timestep), device)
         frame.to_csv(output_dir / f"condition_usage_per_target_t{int(timestep)}.csv", index=False, encoding="utf-8-sig")
         summary = _summarize(frame, timestep, config)
         (output_dir / f"condition_usage_summary_t{int(timestep)}.json").write_text(
@@ -332,9 +433,17 @@ def _diagnose_with_process(process, config, dataset_dir, output_dir, *, split="m
         )
         results[str(int(timestep))] = summary
 
+        if block_breakdown:
+            block_path = output_dir / f"block_breakdown_t{int(timestep)}.csv"
+            pd.DataFrame(block_breakdown).to_csv(block_path, index=False, encoding="utf-8-sig")
+            block_breakdown_paths[str(int(timestep))] = str(block_path)
+        else:
+            block_breakdown_paths[str(int(timestep))] = None
+
     return {
         "split": split, "record_count": int(len(dataset)), "timesteps": [int(value) for value in timesteps],
         "prediction_type": config.get("prediction_type"), "results": results,
+        "block_breakdown": block_breakdown_paths,
     }
 
 
