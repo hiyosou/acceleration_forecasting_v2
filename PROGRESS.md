@@ -801,3 +801,57 @@ artifacts/runs/{epsilon,v_prediction}/model/best_model.pt --split model_validati
 - 判定: GO。SELF_RETRIEVAL_CHECK.md・SELF_GUIDE_CHECK.mdともに実行まで完了。
   成果物自体(`artifacts/retrieval/self_check/`、`artifacts/runs/*/self_guide_check/`)は
   `.gitignore`済みのため非コミット、本ログの記録のみコミットする。
+
+## [2026-09-30] 方針転換: 生成モジュールの精度向上に着手。自己参照(guide=自分自身の正解)条件での再学習実験
+
+ユーザーの指示により、以降は検索側ではなく**生成モジュール側の改善**を軸に進める。第一歩として、
+「検索機能が100%機能している理想条件で、モデルは類似時系列を活用して正しい値を生成できるか」を
+確認するため、旧リポジトリのexperiment_b相当(guideを自分自身の正解に固定して再学習)をv2の
+アーキテクチャ・データで再現した。
+
+### 実装
+
+`src/acceleration_forecasting_v2/datasets/self_reference.py`(`build_self_reference_dataset`)。
+既存の`prepare_datasets`出力をそのまま再利用し、guide関連配列だけを「そのレコード自身の正解」に
+差し替えた別データセットを構築する。旧リポジトリの`datasets/self_guide.py`
+(`diagnostic_mode="self_target_single_guide"`)を踏襲し、TOP_K=3スロットのうち**1スロットだけ**に
+自分自身の正解を入れ、残り2スロットは無効のままにする(3件とも自分自身で埋めるのではない)。
+history_values/target_values/正規化統計は元のデータセットから無変更で引き継ぐ。このデータセットは
+SPEC.mdのリーク防止規則を意図的に破る特殊用途であり、`verify_dataset_leakage`は適用しない
+(適用すれば正しく違反として検出されることをテストで確認済み)。CLIに
+`build-self-reference-dataset`を追加。テスト10件、`.venv/Scripts/python.exe -m pytest tests/ -q`は
+206 passed(既存196+新規10)。
+
+### 実行(実データ、model_train 36,657件/model_validation 3,301件/inference 1,119件、通常の本番学習設定)
+
+epsilon・v_prediction両方を200エポック上限・patience=20で学習(実データの実際の検索結果を使った
+通常の学習と全く同じ設定)。
+
+| | epsilon | v_prediction |
+|---|---|---|
+| 学習完了エポック数 | 150(早期終了) | 142(早期終了) |
+| 学習所要時間 | 約4.5時間 | 約4.3時間 |
+| 予測(DDIM、model_validation 3,301件)所要時間 | 約5.2時間 | 約4.6時間 |
+| **MAE(record-level)** | **0.00102** | **0.00093** |
+| **MAE(segment-level)** | **0.00115** | **0.00104** |
+| **correlation(record-level)** | **0.99996** | **0.99996** |
+| correlation(segment-level) | 0.99994 | 0.99995 |
+
+### 解釈
+
+両パラメータ化とも**ほぼ完璧(相関係数0.9999台、MAEは通常運用時の1/200以下)**という結果になった。
+旧リポジトリのexperiment_b(v_prediction、correlation=0.504、MAE=0.296、model_train 285件)を
+はるかに上回る。この差は、モデルの能力そのものよりも**学習データ量の差**(v2は36,657件 vs
+旧285件)で説明できると考えられる——「guideの値をそのまま出力にコピーする」という写像は本質的に
+単純なショートカットであり、十分な件数の学習例があれば容易にほぼ完璧に学習できてしまう。
+
+ユーザーとの相談の結果、**この「理想条件での再学習」自体はこれ以上追求しても得るものが少ないと
+判断し、方針を転換した**: 「新規学習によるguide=正解での上限確認」ではなく、**「実際の検索結果で
+学習済みの現行モデルに、推論時だけ完璧なguide(自分自身の正解)を与えたら改善するか」**(再学習
+なし)を次に確認する方向で合意した。この検証(`diagnose_guide_conditioning`への`self_target`
+条件追加)は次のステップとして未実装。また旧リポジトリにもこの「再学習なし・自己参照のみ」の
+実験は存在しないことをコード確認済み(`diagnose_self_guide_conditioning`はnormal/shuffled/disabled
+の3パターンのみサポート)。
+
+- 判定: GO(実験完了・記録)。次のステップ(推論時のみのself_target条件追加)はユーザーの
+  意思決定待ち。
