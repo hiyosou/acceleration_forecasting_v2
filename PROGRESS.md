@@ -1054,3 +1054,78 @@ epsilonのみを再学習した(ユーザーとの事前合意通り)。
   明確に否定的だったため)。次の方向性(実データのguide品質自体の改善、self_target的な
   補助損失を伴う学習、または「生成モジュールの精度向上」というテーマ自体の見直し)は
   ユーザーの判断を仰ぐ。
+
+## [2026-09-30] self_target補助損失(self_target_loss_weight)を追加、epsilonで再学習 — 部分的な改善、主判定基準は僅差で未達
+
+前項の結論(ボトルネックはアーキテクチャの容量ではなく学習のインセンティブ)を受け、
+今回は損失関数側を変更した。通常の学習(実際の検索結果によるguide、real loss)に加え、
+**同じバッチ・同じタイムステップ・同じノイズで、guideを自分自身の正解に差し替えた場合の
+損失(self_target loss)を補助項として加算**(重み1.0、1:1)。アーキテクチャは現行の
+`ReferenceModulatedUNetV2`のまま(`context_residual`は含めない、前項の実験と変数を分離)。
+
+実装: `datasets/self_reference.py`に`build_self_target_batch`を公開関数として移設
+(元は`inference/self_guide_diagnostics.py`のprivate関数、ロジック無変更、
+`self_guide_diagnostics.py`側はエイリアスimportで既存呼び出し・既存テストを維持)。
+`training/train.py`に`self_target_loss_weight`パラメータ追加(既定0.0で完全に
+bit-identical、`noise`/`timesteps`を呼び出し側で明示的に事前サンプリングしreal/
+self_target両方のper_record_loss呼び出しに同じ値を渡すことで低分散な対比較にした)。
+`validation_loss()`は無変更(補助損失を含めない、early stopping・比較可能性を維持)。
+CLIに`--self-target-loss-weight`追加。テスト7件追加(bit-identical回帰テスト、
+負の値の拒否、weight>0でtrain_lossが変化する検証、モデルパラメータが実際に変わる
+スモークテスト、**大きめのweightで学習したモデルは同一noise/timestepsでreal guide
+よりself_target guideのper_record_lossが低くなる**という振る舞いレベルの検出力テスト
+[意図的にguideを無情報にした合成データで確認、合格]、resume時のmismatch拒否)。
+`.venv/Scripts/python.exe -m pytest tests/ -q`: 233 passed(既存226+新規7)。
+
+### 実行: epsilonの再学習(self_target_loss_weight=1.0)
+
+52エポックで早期終了(約3時間、1ステップあたりforwardが2回になるため従来の約2倍/epoch)。
+パラメータ数は現行epsilonと同一の4,876,537(補助損失は既存パラメータの使われ方を
+変えるだけで、新規パラメータは追加していない)。
+
+### 判定(事前に確定した基準による、事後の恣意的判断なし)
+
+基準値は現行epsilon(`artifacts/runs/epsilon/`): `guide_advantage_vs_shuffled.mean=
+-0.002210`、`self_target_improvement.mean=+0.000261`、`normal_MAE_mean=0.207969`、
+`guide_advantage_vs_disabled.mean=0.068081`。
+
+| 判定基準 | 基準値 | 新checkpoint | 判定 |
+|---|---|---|---|
+| 1. self_target_improvement.mean **>= 0.01**(健全性、必要条件) | +0.000261 | **+0.116163** | **○ 合格**(基準値の約445倍) |
+| 1. self_target_improvement.median **> 0** | +0.000402 | +0.094379 | ○ 合格 |
+| 2. guide_advantage_vs_shuffled.mean **>= 0.01**(主判定基準) | -0.002210 | **+0.008241** | **✗ 僅差で不合格**(符号は反転し正に転じたが閾値未達) |
+| 2. guide_advantage_vs_shuffled.median **> 0** | - | +0.006079 | ○ 合格 |
+| (参考)normal_MAE_mean | 0.207969 | 0.200821(-3.4%) | 記録のみ、改善 |
+| (参考)guide_advantage_vs_disabled.mean | 0.068081 | 0.026604 | 記録のみ、縮小(下記解釈参照) |
+
+**基準1(健全性)は圧倒的に合格し、補助損失の仕組みが意図通り機能していることを実データ
+でも確認できた。しかし主判定基準(基準2)のmeanが0.008241と、事前に定めた閾値0.01に
+僅差で届かなかった(medianは正)。計画書で事前に規定していた「0.002〜0.008程度の弱い
+正の変化は結論を出すには不十分」という判断基準に照らし、事前合意通りステップ3
+(predict+evaluate、約5時間)は今回は実行せず打ち切った。**
+
+### 解釈
+
+self_target条件そのもの(guideを完全に自分の正解に差し替えた場合)への反応は劇的に
+改善した(self_target_improvement.meanが+0.000261→+0.116163、self_target_attention_rank_1
+も0.91と、以前の「診断」実験と同水準の高い集中を示す)。これは補助損失が意図通り、
+モデルに強い信号への反応性を学習させたことの明確な証拠である。
+
+一方、実際の検索結果(相対的に弱い信号)に対する反応(guide_advantage_vs_shuffled)は、
+符号が負から正に転じ、`context_residual`実験(+0.000722)を上回る改善を見せたものの、
+事前に設定した閾値には僅かに届かなかった。normal_MAEも0.208→0.201に改善している一方、
+guide_advantage_vs_disabledは0.068→0.027に縮小した——これはdisabled条件のMAEそのものが
+0.276→0.227へ大きく改善したためで(モデル全体の予測能力そのものが補助損失により底上げ
+された可能性)、guide利用の後退を意味するものではないと考えられる。
+
+総合すると、「self_target的な強い信号への反復的な曝露」は、`context_residual`
+(アーキテクチャの容量を増やすだけ)よりも明確に効果があり、方向性としては支持される。
+ただし今回のweight=1.0では、実データの弱いguideに対する反応の改善が事前に定めた
+「結論を出すに足る」水準には届かなかった。計画書はこの結果のケースを想定しており、
+「weightを上げて再実行を検討する」という選択肢を提示している。
+
+- 判定: 主判定基準は僅差で不合格のため、ステップ3(predict+evaluate)は打ち切り。
+  健全性チェックの圧倒的な合格と、基準2が符号反転かつcontext_residualを上回る水準まで
+  改善したことから、方向性自体は有望と判断する。次の一手(weightを上げて再実行するか、
+  ここで打ち切るか、あるいは主判定基準の僅差の不合格を許容してステップ3に進むか)は
+  ユーザーの判断を仰ぐ。
