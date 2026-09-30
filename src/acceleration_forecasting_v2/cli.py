@@ -56,6 +56,9 @@ def _parser():
     p.add_argument("--device")
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--no-progress", action="store_true")
+    p.add_argument("--self-target-loss-weight", type=float, default=0.0,
+                   help="0より大きいと、同じバッチでguideを自分自身の正解に差し替えた場合の"
+                        "損失を補助項として加算する(既定0.0で既存動作と完全に同一)")
 
     p = commands.add_parser("predict", help="DDIMで予測(median/p10/p90)")
     p.add_argument("--dataset-dir", required=True)
@@ -132,7 +135,8 @@ def main(argv=None) -> int:
         result = train(args.dataset_dir, args.output_dir, device=args.device, epochs=args.epochs,
                        batch_size=args.batch_size, patience=args.patience, seed=args.seed,
                        resume=not args.no_resume, progress=not args.no_progress,
-                       prediction_type=args.prediction_type)
+                       prediction_type=args.prediction_type,
+                       self_target_loss_weight=args.self_target_loss_weight)
     elif args.command == "predict":
         from acceleration_forecasting_v2.inference.predict import predict
         result = predict(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split, device=args.device,

@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from synthetic_artifacts import build_artifacts
 
@@ -14,6 +15,7 @@ from acceleration_forecasting_v2.datasets.self_reference import (
     SPLITS as SELF_REFERENCE_SPLITS,
     _self_reference_arrays,
     build_self_reference_dataset,
+    build_self_target_batch,
 )
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.datasets.verify import verify_dataset_leakage
@@ -138,3 +140,22 @@ def test_output_directory_must_differ_from_source(prepared):
 
 def test_self_reference_splits_constant_matches_prepare_splits():
     assert set(SELF_REFERENCE_SPLITS) == set(SPLITS)
+
+
+def test_build_self_target_batch_fills_only_slot_zero_with_condition_normalized_target(prepared):
+    # inference/self_guide_diagnostics.pyの_build_self_target_batchが元々持っていたテストと
+    # 同じアサーションを、公開移設先(datasets.self_reference.build_self_target_batch)に
+    # 対して行う(公開APIそのものに直接カバレッジを持たせる)。
+    dataset = ForecastDatasetV2(prepared / "model_validation", prepared, include_targets=True)
+    batch = {key: (value.unsqueeze(0) if torch.is_tensor(value) else value) for key, value in dataset[0].items()}
+    current_values = np.array([1.0], dtype=np.float32)
+
+    self_target = build_self_target_batch(dataset, batch, current_values)
+    expected_guide_values = dataset.condition_norm.normalize(dataset.denormalize_target(batch["target"].numpy()))
+    np.testing.assert_allclose(self_target["guide_values"][:, 0].numpy(), expected_guide_values, atol=1e-4)
+    np.testing.assert_array_equal(self_target["guide_mask"][:, 0].numpy(), batch["target_mask"].numpy())
+    assert self_target["guide_mask"][:, 1:].sum() == 0
+    assert self_target["retrieval_mask"][0, 0] == 1.0
+    assert self_target["retrieval_mask"][0, 1:].sum() == 0
+    assert self_target["guide_similarities"][0, 0] == 1.0
+    assert torch.equal(self_target["history_values"], batch["history_values"])

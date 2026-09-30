@@ -29,6 +29,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
+from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch as _build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from .predict import load_process
 
@@ -97,53 +98,6 @@ def _apply_shuffled_guides(batch):
     for field in _GUIDE_FIELDS:
         shuffled[field] = batch[f"shuffled_{field}"]
     return shuffled
-
-
-def _build_self_target_batch(dataset, batch, current_values):
-    """既存のbatch(実際の検索結果によるguide)から、guideを**そのレコード自身の正解**に
-    差し替えたbatchを作る(再学習なし、推論時のみ)。
-
-    `datasets.self_reference._self_reference_arrays`と同じ規約: TOP_K=3スロットのうち
-    **1スロットだけ**に自分自身の正解を入れ、残り2スロットは無効(mask=0)のままにする。
-
-    guide_valuesはcondition_norm(history/guideと同じ正規化統計)で正規化する必要がある
-    ——targetはtarget_normで正規化されているため、一度物理値に戻してから
-    condition_normで正規化し直す(単純にtargetをそのまま流用できない)。
-    """
-    target, mask = batch["target"], batch["target_mask"]
-    device = target.device
-    physical_target = dataset.denormalize_target(target.detach().cpu().numpy())
-    mask_np = mask.detach().cpu().numpy()
-    valid = mask_np > 0
-
-    guide_values_physical = np.where(valid, physical_target, 0.0)
-    guide_values_normalized = dataset.condition_norm.normalize(guide_values_physical)
-    guide_values_normalized = np.nan_to_num(guide_values_normalized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    delta_physical = np.where(valid, physical_target - np.asarray(current_values, dtype=np.float32)[:, None], 0.0)
-    delta_normalized = np.nan_to_num(
-        delta_physical / dataset.condition_norm.std, nan=0.0, posinf=0.0, neginf=0.0
-    ).astype(np.float32)
-
-    batch_size, months = physical_target.shape
-    guide_values = np.zeros((batch_size, 3, months), dtype=np.float32)
-    guide_masks = np.zeros((batch_size, 3, months), dtype=np.float32)
-    guide_deltas = np.zeros((batch_size, 3, months), dtype=np.float32)
-    guide_similarities = np.zeros((batch_size, 3), dtype=np.float32)
-    retrieval_masks = np.zeros((batch_size, 3), dtype=np.float32)
-    guide_values[:, 0] = guide_values_normalized
-    guide_masks[:, 0] = valid.astype(np.float32)
-    guide_deltas[:, 0] = delta_normalized
-    guide_similarities[:, 0] = 1.0
-    retrieval_masks[:, 0] = 1.0
-
-    self_target = dict(batch)
-    self_target["guide_values"] = torch.from_numpy(guide_values).to(device)
-    self_target["guide_mask"] = torch.from_numpy(guide_masks).to(device)
-    self_target["guide_deltas"] = torch.from_numpy(guide_deltas).to(device)
-    self_target["guide_similarities"] = torch.from_numpy(guide_similarities).to(device)
-    self_target["retrieval_mask"] = torch.from_numpy(retrieval_masks).to(device)
-    return self_target
 
 
 def _per_record_attention_ranks(model):

@@ -30,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
 
 from acceleration_forecasting_v2.common.constants import TOP_K
 from .build import ARRAY_NAMES
@@ -127,3 +128,55 @@ def build_self_reference_dataset(source_dataset_dir, output_dataset_dir, *, top_
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return summary
+
+
+def build_self_target_batch(dataset, batch, current_values):
+    """既存のbatch(実際の検索結果によるguide、またはミニバッチ学習中のbatch)から、
+    guideを**そのレコード自身の正解**に差し替えたbatchを作る。
+
+    `_self_reference_arrays`と同じ規約: TOP_K=3スロットのうち**1スロットだけ**に
+    自分自身の正解を入れ、残り2スロットは無効(mask=0)のままにする。
+
+    guide_valuesはcondition_norm(history/guideと同じ正規化統計)で正規化する必要がある
+    ——targetはtarget_normで正規化されているため、一度物理値に戻してから
+    condition_normで正規化し直す(単純にtargetをそのまま流用できない)。
+
+    2つの用途で使う:
+    - `inference/self_guide_diagnostics.py`: 再学習なしの推論時診断(self_target条件)。
+    - `training/train.py`: 通常学習への補助損失(self_target_loss_weight > 0のとき)。
+      `dataset`には学習に使っている`ForecastDatasetV2`インスタンス(`train_data`)を渡す。
+    """
+    target, mask = batch["target"], batch["target_mask"]
+    device = target.device
+    physical_target = dataset.denormalize_target(target.detach().cpu().numpy())
+    mask_np = mask.detach().cpu().numpy()
+    valid = mask_np > 0
+
+    guide_values_physical = np.where(valid, physical_target, 0.0)
+    guide_values_normalized = dataset.condition_norm.normalize(guide_values_physical)
+    guide_values_normalized = np.nan_to_num(guide_values_normalized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    delta_physical = np.where(valid, physical_target - np.asarray(current_values, dtype=np.float32)[:, None], 0.0)
+    delta_normalized = np.nan_to_num(
+        delta_physical / dataset.condition_norm.std, nan=0.0, posinf=0.0, neginf=0.0
+    ).astype(np.float32)
+
+    batch_size, months = physical_target.shape
+    guide_values = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_masks = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_deltas = np.zeros((batch_size, 3, months), dtype=np.float32)
+    guide_similarities = np.zeros((batch_size, 3), dtype=np.float32)
+    retrieval_masks = np.zeros((batch_size, 3), dtype=np.float32)
+    guide_values[:, 0] = guide_values_normalized
+    guide_masks[:, 0] = valid.astype(np.float32)
+    guide_deltas[:, 0] = delta_normalized
+    guide_similarities[:, 0] = 1.0
+    retrieval_masks[:, 0] = 1.0
+
+    self_target = dict(batch)
+    self_target["guide_values"] = torch.from_numpy(guide_values).to(device)
+    self_target["guide_mask"] = torch.from_numpy(guide_masks).to(device)
+    self_target["guide_deltas"] = torch.from_numpy(guide_deltas).to(device)
+    self_target["guide_similarities"] = torch.from_numpy(guide_similarities).to(device)
+    self_target["retrieval_mask"] = torch.from_numpy(retrieval_masks).to(device)
+    return self_target
