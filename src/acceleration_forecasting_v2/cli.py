@@ -69,6 +69,11 @@ def _parser():
     p.add_argument("--sampling-steps", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device")
+    p.add_argument("--guide-mode", choices=("retrieved", "self_target"), default="retrieved",
+                   help="self_targetは生成モジュールの上限性能(天井)を測る診断モード:"
+                        "検索guideの代わりに各レコード自身の正解を全DDIMステップに渡す"
+                        "(再学習なし、正解を読み込むためinference splitでも使用時のみ例外的に"
+                        "targetファイルを読む)")
 
     p = commands.add_parser("evaluate", help="record-level / segment-levelで評価")
     p.add_argument("--dataset-dir", required=True)
@@ -140,7 +145,8 @@ def main(argv=None) -> int:
     elif args.command == "predict":
         from acceleration_forecasting_v2.inference.predict import predict
         result = predict(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split, device=args.device,
-                         num_samples=args.num_samples, sampling_steps=args.sampling_steps, seed=args.seed)
+                         num_samples=args.num_samples, sampling_steps=args.sampling_steps, seed=args.seed,
+                         guide_mode=args.guide_mode)
     elif args.command == "evaluate":
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate
         result = evaluate(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split,

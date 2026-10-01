@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
+from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.diffusion.process import DiffusionProcess
 from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
@@ -40,17 +41,26 @@ def _expand(batch, num_samples):
 @torch.inference_mode()
 def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", device=None,
             num_samples=100, sampling_steps=50, eta=0.0, initial_noise_scale=1.0,
-            batch_size=8, seed=42, use_ema=True, bounds=(PHYSICAL_MIN, PHYSICAL_MAX), mixed_precision=None):
+            batch_size=8, seed=42, use_ema=True, bounds=(PHYSICAL_MIN, PHYSICAL_MAX), mixed_precision=None,
+            guide_mode="retrieved"):
     """指定splitの全レコードを予測し、predictions.csvとsamples.npzを書き出す。
 
-    正解(target_values)は一切読み込まない(include_targets=False)ため、
-    未来の実測値が予測に混入することはない。
+    guide_mode="retrieved"(既定)のとき、正解(target_values)は一切読み込まない
+    (include_targets=False)ため、未来の実測値が予測に混入することはない。
+
+    guide_mode="self_target"のときは、生成モジュールの上限性能(天井)を測定するための
+    診断モードになる: 検索で得られた実guideの代わりに、各レコード自身の正解(未来の値)を
+    guideとして全DDIMステップに渡す(再学習はしない、既存checkpointをそのまま使う)。
+    この場合のみ、正解を読み込む(include_targets=True)——通常運用のguide_mode="retrieved"
+    では正解は一切読み込まれない、という既存の安全性は変わらない。
 
     mixed_precision: Noneならcudaのときだけbf16 autocastを使う(学習と同じ精度設定)。
 
     Returns:
         サマリdict(件数・設定)。
     """
+    if guide_mode not in ("retrieved", "self_target"):
+        raise ValueError(f"未知のguide_mode: {guide_mode!r}(retrieved/self_targetのいずれか)")
     dataset_dir, output_dir = Path(dataset_dir), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -58,10 +68,12 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     use_autocast = device.type == "cuda" if mixed_precision is None else bool(mixed_precision)
     autocast_dtype = torch.bfloat16 if use_autocast and device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
 
-    dataset = ForecastDatasetV2(dataset_dir / split, dataset_dir, include_targets=False)
+    include_targets = guide_mode == "self_target"
+    dataset = ForecastDatasetV2(dataset_dir / split, dataset_dir, include_targets=include_targets)
     metadata = pd.read_csv(dataset_dir / split / "metadata.csv", encoding="utf-8-sig")
     if len(metadata) != len(dataset):
         raise ValueError("metadata.csv と配列のレコード数が一致しません。")
+    current_values = metadata["current_acc_z_max"].to_numpy(dtype=np.float32) if include_targets else None
     normalized_clip = tuple(float(value) for value in dataset.target_norm.normalize(np.asarray(bounds, np.float32)))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     generator = torch.Generator(device=device).manual_seed(int(seed))
@@ -70,6 +82,9 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     for batch in loader:
         batch = {key: value.to(device) for key, value in batch.items()}
         size = batch["history_values"].shape[0]
+        if include_targets:
+            positions = batch["index"].cpu().numpy()
+            batch = build_self_target_batch(dataset, batch, current_values[positions])
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
             normalized = process.ddim(
                 _expand(batch, num_samples), shape=(size * num_samples, 12), sampling_steps=sampling_steps,
@@ -100,6 +115,7 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
         "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed),
         "prediction_type": config["prediction_type"], "bounds": [float(bounds[0]), float(bounds[1])],
         "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema), "mixed_precision": bool(use_autocast),
+        "guide_mode": guide_mode,
     }
     (output_dir / "prediction_run.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

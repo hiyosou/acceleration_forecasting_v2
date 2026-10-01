@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from test_training import _raw_split, _train_kwargs
+from test_training import _raw_split, _raw_split_with_current_max, _train_kwargs
 
 from acceleration_forecasting_v2.datasets.build import write_dataset
 from acceleration_forecasting_v2.inference.predict import predict
@@ -22,6 +22,21 @@ def trained(tmp_path_factory):
         "model_train": _raw_split(32, seed=1),
         "model_validation": _raw_split(16, seed=2),
         "inference": _raw_split(N_INFERENCE, seed=3),
+    }, dataset_dir)
+    train(dataset_dir, root / "run", **_train_kwargs(epochs=2))
+    return dataset_dir, root / "run" / "best_model.pt"
+
+
+@pytest.fixture(scope="module")
+def trained_with_current_max(tmp_path_factory):
+    # guide_mode="self_target"はcurrent_acc_z_max列(build_self_target_batchが要求)を
+    # 必要とするため、別fixtureとして用意する(既定のtrained fixtureには存在しない)。
+    root = tmp_path_factory.mktemp("predict_self_target")
+    dataset_dir = root / "dataset"
+    write_dataset({
+        "model_train": _raw_split_with_current_max(32, seed=1),
+        "model_validation": _raw_split_with_current_max(16, seed=2),
+        "inference": _raw_split_with_current_max(N_INFERENCE, seed=3),
     }, dataset_dir)
     train(dataset_dir, root / "run", **_train_kwargs(epochs=2))
     return dataset_dir, root / "run" / "best_model.pt"
@@ -116,6 +131,62 @@ def test_run_summary_records_configuration(trained, tmp_path):
 def test_mixed_precision_is_off_on_cpu_by_default(trained, tmp_path):
     summary = _predict(trained, tmp_path / "out")
     assert summary["mixed_precision"] is False
+
+
+def test_guide_mode_rejects_unknown_value(trained, tmp_path):
+    dataset_dir, checkpoint = trained
+    with pytest.raises(ValueError, match="guide_mode"):
+        predict(dataset_dir, checkpoint, tmp_path / "out", device="cpu", num_samples=2, sampling_steps=2,
+               guide_mode="bogus")
+
+
+def test_guide_mode_retrieved_matches_omitting_the_parameter(trained, tmp_path):
+    # guide_mode="retrieved"(既定)を明示しても、省略した場合と完全にbit-identical。
+    _predict(trained, tmp_path / "a", seed=1)
+    _predict(trained, tmp_path / "b", seed=1, guide_mode="retrieved")
+    a = np.load(tmp_path / "a" / "samples.npz")["samples"]
+    b = np.load(tmp_path / "b" / "samples.npz")["samples"]
+    np.testing.assert_array_equal(a, b)
+
+
+def test_guide_mode_self_target_requires_target_files(trained_with_current_max, tmp_path):
+    # guide_mode="retrieved"(既定)は正解ファイルが無くても動く(test_prediction_does_not_
+    # read_target_filesの通り)が、guide_mode="self_target"は正解を必要とするため、
+    # 正解ファイルが無いと明確なエラーで失敗するべき(サイレントに壊れた結果を返さない)。
+    dataset_dir, checkpoint = trained_with_current_max
+    import shutil
+    copy_dir = tmp_path / "dataset_copy"
+    shutil.copytree(dataset_dir, copy_dir)
+    (copy_dir / "inference" / "target_values.npy").unlink()
+    with pytest.raises(FileNotFoundError):
+        predict(copy_dir, checkpoint, tmp_path / "out", device="cpu", num_samples=2, sampling_steps=2,
+               guide_mode="self_target")
+
+
+def test_guide_mode_self_target_records_target_count_and_run_summary(trained_with_current_max, tmp_path):
+    dataset_dir, checkpoint = trained_with_current_max
+    summary = predict(dataset_dir, checkpoint, tmp_path / "out", device="cpu", num_samples=6, sampling_steps=4,
+                      batch_size=2, seed=0, guide_mode="self_target")
+    assert summary["guide_mode"] == "self_target"
+    assert summary["record_count"] == N_INFERENCE
+    frame = pd.read_csv(tmp_path / "out" / "predictions.csv")
+    assert len(frame) == N_INFERENCE * 12
+
+
+def test_guide_mode_self_target_differs_from_retrieved(trained_with_current_max, tmp_path):
+    # guideの中身を変えているので(検索結果→自分自身の正解)、同一seedでも出力は変わるはず。
+    dataset_dir, checkpoint = trained_with_current_max
+    kwargs = dict(device="cpu", num_samples=6, sampling_steps=4, batch_size=2, seed=0)
+    predict(dataset_dir, checkpoint, tmp_path / "retrieved", guide_mode="retrieved", **kwargs)
+    predict(dataset_dir, checkpoint, tmp_path / "self_target", guide_mode="self_target", **kwargs)
+    retrieved = pd.read_csv(tmp_path / "retrieved" / "predictions.csv")["prediction_median"].to_numpy()
+    self_target = pd.read_csv(tmp_path / "self_target" / "predictions.csv")["prediction_median"].to_numpy()
+    assert not np.allclose(retrieved, self_target)
+
+
+def test_run_summary_records_guide_mode(trained, tmp_path):
+    summary = _predict(trained, tmp_path / "out")
+    assert summary["guide_mode"] == "retrieved"
 
 
 @pytest.mark.gpu
