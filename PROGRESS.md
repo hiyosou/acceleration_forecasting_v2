@@ -1060,8 +1060,10 @@ epsilonのみを再学習した(ユーザーとの事前合意通り)。
 前項の結論(ボトルネックはアーキテクチャの容量ではなく学習のインセンティブ)を受け、
 今回は損失関数側を変更した。通常の学習(実際の検索結果によるguide、real loss)に加え、
 **同じバッチ・同じタイムステップ・同じノイズで、guideを自分自身の正解に差し替えた場合の
-損失(self_target loss)を補助項として加算**(重み1.0、1:1)。アーキテクチャは現行の
-`ReferenceModulatedUNetV2`のまま(`context_residual`は含めない、前項の実験と変数を分離)。
+損失(self_target loss)を補助項として加算**(重み1.0、1:1)。意図としては
+アーキテクチャは前項の`context_residual`を含まない現行`ReferenceModulatedUNetV2`のまま、
+損失関数のみを変数として分離するはずだった(下記「実行」節の訂正を参照——実際には
+`context_residual`を含んだコードベースで実行してしまった)。
 
 実装: `datasets/self_reference.py`に`build_self_target_batch`を公開関数として移設
 (元は`inference/self_guide_diagnostics.py`のprivate関数、ロジック無変更、
@@ -1080,8 +1082,16 @@ CLIに`--self-target-loss-weight`追加。テスト7件追加(bit-identical回�
 ### 実行: epsilonの再学習(self_target_loss_weight=1.0)
 
 52エポックで早期終了(約3時間、1ステップあたりforwardが2回になるため従来の約2倍/epoch)。
-パラメータ数は現行epsilonと同一の4,876,537(補助損失は既存パラメータの使われ方を
-変えるだけで、新規パラメータは追加していない)。
+
+**【訂正】パラメータ数は5,040,377であり、前項の`context_residual`実験と同一だった
+(resolved_config.json・training出力のparameter_countで確認)。これは、`context_residual`
+が`models/reference_modulated_unet.py`に無条件で(フラグなどで切り替え不可能な形で)
+組み込まれたため、本実験で使用したコードベースには既に`context_residual`が含まれていた
+ことによる。当初「現行アーキテクチャのまま(`context_residual`は含めない)」と記録したのは
+誤りであり、実際には**本実験はcontext_residual + self_target_loss_weightの組み合わせを
+既に検証していたことになる**(計画段階で意図していた変数分離は実現できていなかった)。
+基準となる現行epsilon(`artifacts/runs/epsilon/`、パラメータ数4,876,537)は
+`context_residual`導入より前に学習されたものなので、この基準との比較自体は妥当である。
 
 ### 判定(事前に確定した基準による、事後の恣意的判断なし)
 
