@@ -181,3 +181,30 @@ def test_residual_delta_fusion_has_no_context_residual_attribute():
     )
     for block in model.reference_blocks:
         assert not hasattr(block.reference_attention, "context_residual")
+
+
+def test_context_residual_enabled_false_has_no_context_residual_attribute_or_state_dict_key():
+    # 2026-10-05追加: context_residual導入より前に学習したcheckpointを現行コードで
+    # 読み込めるようにするためのフラグ。Falseにすると、ratd_condition_reconstruction
+    # 融合であってもcontext_residual自体が構築されない(属性もstate_dictキーも無い)。
+    model = ReferenceModulatedUNetV2(context_residual_enabled=False)  # 既定はratd_condition_reconstruction
+    for block in model.reference_blocks:
+        assert not hasattr(block.reference_attention, "context_residual")
+    assert not any("context_residual" in key for key in model.state_dict())
+
+
+def test_context_residual_enabled_false_forward_matches_pre_change_architecture():
+    # context_residual_enabled=Falseのforwardは、context_residualを一切使わない
+    # (condition_fusionの出力のみ)経路になる——有限な出力が得られ、例外なく動く。
+    model = ReferenceModulatedUNetV2(context_residual_enabled=False)
+    batch = _dummy_batch(batch_size=2)
+    output = model(torch.randn(2, 12), torch.randint(0, 1000, (2,)), batch)
+    assert torch.isfinite(output).all()
+
+
+def test_context_residual_enabled_false_state_dict_round_trips_into_a_matching_model():
+    # context_residual無しで保存したcheckpointを、同じ設定の新規モデルに読み込める
+    # (predict.py::load_processの自動判定が成立するための前提)。
+    source = ReferenceModulatedUNetV2(context_residual_enabled=False)
+    target = ReferenceModulatedUNetV2(context_residual_enabled=False)
+    target.load_state_dict(source.state_dict())  # 例外が出なければOK

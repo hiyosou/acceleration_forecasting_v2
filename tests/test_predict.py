@@ -3,11 +3,12 @@
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
 from test_training import _raw_split, _raw_split_with_current_max, _train_kwargs
 
 from acceleration_forecasting_v2.datasets.build import write_dataset
-from acceleration_forecasting_v2.inference.predict import predict
+from acceleration_forecasting_v2.inference.predict import load_process, predict
 from acceleration_forecasting_v2.training.train import train
 
 
@@ -187,6 +188,24 @@ def test_guide_mode_self_target_differs_from_retrieved(trained_with_current_max,
 def test_run_summary_records_guide_mode(trained, tmp_path):
     summary = _predict(trained, tmp_path / "out")
     assert summary["guide_mode"] == "retrieved"
+
+
+def test_load_process_reads_a_checkpoint_saved_without_context_residual(tmp_path):
+    # 2026-10-05: context_residual導入(2026-09-30)より前に学習したcheckpointも、
+    # 現行コードでそのまま読み込めることの回帰テスト(state_dictのキーから自動判定、
+    # models/reference_modulated_unet.pyのcontext_residual_enabledフラグ参照)。
+    from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
+
+    model = ReferenceModulatedUNetV2(context_residual_enabled=False)
+    checkpoint_path = tmp_path / "pre_context_residual.pt"
+    torch.save({
+        "model_state_dict": model.state_dict(), "ema_state_dict": model.state_dict(),
+        "model_config": {"dropout": 0.1, "prediction_type": "epsilon", "diffusion_steps": 1000},
+    }, checkpoint_path)
+
+    process, config = load_process(checkpoint_path, "cpu")
+    assert not any("context_residual" in key for key in process.model.state_dict())
+    assert config["prediction_type"] == "epsilon"
 
 
 @pytest.mark.gpu

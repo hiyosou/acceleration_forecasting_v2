@@ -23,11 +23,18 @@ from acceleration_forecasting_v2.models.reference_modulated_unet import Referenc
 
 
 def load_process(checkpoint_path, device, *, use_ema=True):
-    """checkpointからモデルとDiffusionProcessを復元する(validationと同じEMA重みが既定)。"""
+    """checkpointからモデルとDiffusionProcessを復元する(validationと同じEMA重みが既定)。
+
+    context_residual(2026-09-30実験)導入より前に学習したcheckpointはこの重みを
+    持たないため、model_configの値を信用せず、実際に読み込むstate_dictのキーから
+    直接自動判定する(新旧どちらのcheckpointも同じ呼び出しで正しく読み込めるように)。
+    """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint["model_config"]
-    model = ReferenceModulatedUNetV2(config["dropout"]).to(device)
-    model.load_state_dict(checkpoint["ema_state_dict" if use_ema else "model_state_dict"])
+    state_dict = checkpoint["ema_state_dict" if use_ema else "model_state_dict"]
+    context_residual_enabled = any("context_residual" in key for key in state_dict)
+    model = ReferenceModulatedUNetV2(config["dropout"], context_residual_enabled=context_residual_enabled).to(device)
+    model.load_state_dict(state_dict)
     model.eval()
     process = DiffusionProcess(model, config["diffusion_steps"], prediction_type=config["prediction_type"]).to(device)
     return process, config

@@ -115,7 +115,8 @@ class ReferenceModulatedAttention(nn.Module):
     """
 
     def __init__(self, channels, condition_dim=256, reference_dim=64, heads=8, head_dim=8,
-                 use_similarity_bias=True, attention_mode="global", fusion_type="residual_delta"):
+                 use_similarity_bias=True, attention_mode="global", fusion_type="residual_delta",
+                 context_residual_enabled=True):
         super().__init__()
         if attention_mode not in {"global", "month_aligned"}:
             raise ValueError("attention_mode must be global or month_aligned")
@@ -124,6 +125,10 @@ class ReferenceModulatedAttention(nn.Module):
         self.use_similarity_bias = bool(use_similarity_bias)
         self.attention_mode = attention_mode
         self.fusion_type = fusion_type
+        # 2026-10-05: 初期チェックポイント(context_residual導入より前に学習したもの)を
+        # 現行コードで読み込めるようにするため、フラグ化した(既定Trueで現行動作を維持)。
+        # PROGRESS.md参照。
+        self.context_residual_enabled = bool(context_residual_enabled) and fusion_type == "ratd_condition_reconstruction"
         self.heads, self.head_dim = int(heads), int(head_dim)
         inner = self.heads * self.head_dim
         self.query = nn.Linear(channels + condition_dim, inner, bias=False)
@@ -136,8 +141,9 @@ class ReferenceModulatedAttention(nn.Module):
                 nn.Linear(channels + condition_dim + inner, condition_dim), nn.SiLU(),
                 nn.Linear(condition_dim, condition_dim),
             )
-            self.context_residual = nn.Linear(inner, condition_dim, bias=False)
-            nn.init.zeros_(self.context_residual.weight)
+            if self.context_residual_enabled:
+                self.context_residual = nn.Linear(inner, condition_dim, bias=False)
+                nn.init.zeros_(self.context_residual.weight)
         if self.use_similarity_bias:
             self.similarity_scale = nn.Parameter(torch.tensor(1.0))
         self.last_attention = None
@@ -187,7 +193,9 @@ class ReferenceModulatedAttention(nn.Module):
             pooled_values = values.mean(dim=-1)
             output_condition = self.condition_fusion(
                 torch.cat([pooled_values, condition, pooled_context], dim=-1)
-            ) + self.context_residual(pooled_context)
+            )
+            if self.context_residual_enabled:
+                output_condition = output_condition + self.context_residual(pooled_context)
         else:
             output_condition = condition + self.condition_output(pooled_context)
         self.last_attention = weights.detach()
@@ -200,12 +208,13 @@ class ReferenceModulatedBlock(nn.Module):
 
     def __init__(self, channels, dropout=0.1, use_similarity_bias=True,
                  attention_mode="global", fusion_type="residual_delta", heads=8, head_dim=8,
-                 condition_dim=256, reference_dim=64):
+                 condition_dim=256, reference_dim=64, context_residual_enabled=True):
         super().__init__()
         self.reference_attention = ReferenceModulatedAttention(
             channels, use_similarity_bias=use_similarity_bias, attention_mode=attention_mode,
             fusion_type=fusion_type, heads=heads, head_dim=head_dim,
             condition_dim=condition_dim, reference_dim=reference_dim,
+            context_residual_enabled=context_residual_enabled,
         )
         self.residual = ConditionalBlock(channels, dropout, condition_dim=condition_dim)
 
@@ -242,11 +251,17 @@ class ReferenceModulatedUNetV2(nn.Module):
         reference_dim: int = 64,
         attention_heads: int = 8,
         attention_head_dim: int = 8,
+        # 2026-10-05追加: context_residual(2026-09-30実験)導入より前に学習した
+        # checkpointを現行コードで読み込めるようにするためのフラグ(既定Trueで
+        # 現行の本番アーキテクチャと同一)。`inference/predict.py::load_process`が
+        # checkpointのstate_dictから自動判定して渡す。PROGRESS.md参照。
+        context_residual_enabled: bool = True,
     ):
         super().__init__()
         self.history_months = int(history_months)
         self.forecast_months = int(forecast_months)
         self.reference_similarity_enabled = bool(reference_similarity_enabled)
+        self.context_residual_enabled = bool(context_residual_enabled)
         self.reference_attention_mode = reference_attention_mode
         self.reference_fusion_type = reference_fusion_type
         self.base_channels = int(base_channels)
@@ -282,6 +297,7 @@ class ReferenceModulatedUNetV2(nn.Module):
             attention_mode=self.reference_attention_mode, fusion_type=self.reference_fusion_type,
             heads=self.attention_heads, head_dim=self.attention_head_dim,
             condition_dim=self.condition_dim, reference_dim=self.reference_dim,
+            context_residual_enabled=self.context_residual_enabled,
         )
         self.enc12 = nn.ModuleList([block(c1) for _ in range(self.block_counts[0])])
         self.down6 = nn.Conv1d(c1, c2, 3, stride=2, padding=1)
