@@ -94,6 +94,9 @@ def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_
 
 
 def _percentile_stats(values):
+    values = np.asarray(values)
+    if values.size == 0:
+        return {"mean": float("nan"), "median": float("nan"), "p10": float("nan"), "p90": float("nan")}
     return {
         "mean": float(np.mean(values)), "median": float(np.median(values)),
         "p10": float(np.percentile(values, 10)), "p90": float(np.percentile(values, 90)),
@@ -102,11 +105,17 @@ def _percentile_stats(values):
 
 def evaluate_guide_fidelity(dataset_dir, prediction_dir, output_dir, *, split="inference"):
     """生成データ(100サンプル)と、生成条件として使われた検索guide(最大3本)自体との
-    誤差(「guide忠実度」)を評価する。
+    誤差(「guide忠実度」)を評価する。あわせて、guide自体と正解(target)との誤差
+    (「guideの質」、モデル・予測には一切依存しないデータのみの指標)も算出する——
+    両方を並べて見ることで、「生成がguideにどれだけ追従しているか」と「そのguide自体が
+    そもそもどれだけ正解に近いか」を切り分けられる。
 
-    正解(target)とのMAEとは異なり、「生成がどれだけguideの中身に沿っているか」を直接測る。
-    レコードごとに有効なguideスロット(retrieval_masks==1)それぞれとの誤差を計算し、
-    スロット間で平均して1レコード1値にする(有効guideが1本も無いレコードは除外)。
+    正解(target)とのMAEとは異なり、generated_vs_guide_MAEは「生成がどれだけguideの
+    中身に沿っているか」を直接測る。レコードごとに有効なguideスロット
+    (retrieval_masks==1)それぞれとの誤差を計算し、スロット間で平均して1レコード1値に
+    する(有効guideが1本も無いレコードは除外)。guide_vs_target_MAEは同様の平均だが、
+    各guideスロットと有効な月(guide_mask・target_maskの両方が有効な月)だけを対象に
+    正解とのMAEを取る(モデルの予測結果には依存しない、データのみの指標)。
     """
     dataset_dir, prediction_dir, output_dir = Path(dataset_dir), Path(prediction_dir), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,6 +124,8 @@ def evaluate_guide_fidelity(dataset_dir, prediction_dir, output_dir, *, split="i
     guide_values = np.load(split_dir / "guide_values.npy")
     guide_masks = np.load(split_dir / "guide_masks.npy")
     retrieval_masks = np.load(split_dir / "retrieval_masks.npy")
+    target_values = np.load(split_dir / "target_values.npy")
+    target_masks = np.load(split_dir / "target_masks.npy")
     lookup = {str(trend_id): index for index, trend_id in enumerate(metadata["trend_id"])}
 
     with np.load(prediction_dir / "samples.npz", allow_pickle=False) as samples_npz:
@@ -127,20 +138,27 @@ def evaluate_guide_fidelity(dataset_dir, prediction_dir, output_dir, *, split="i
                 continue
             index = lookup[trend_id]
             record_samples = samples[position]
-            slot_errors = []
+            generated_errors, target_errors = [], []
             for slot in range(guide_values.shape[1]):
                 if retrieval_masks[index, slot] <= 0:
                     continue
                 mask = guide_masks[index, slot] > 0
-                if not mask.any():
-                    continue
-                diff = np.abs(record_samples[:, mask] - guide_values[index, slot][mask])
-                slot_errors.append(float(diff.mean()))
-            if not slot_errors:
+                if mask.any():
+                    diff = np.abs(record_samples[:, mask] - guide_values[index, slot][mask])
+                    generated_errors.append(float(diff.mean()))
+                target_mask = mask & (target_masks[index] > 0)
+                if target_mask.any():
+                    target_diff = np.abs(guide_values[index, slot][target_mask] - target_values[index][target_mask])
+                    target_errors.append(float(target_diff.mean()))
+            if not generated_errors:
                 skipped_no_guide += 1
                 continue
-            rows.append({"trend_id": trend_id, "dataset_id": metadata.iloc[index]["dataset_id"],
-                        "guide_slot_count": len(slot_errors), "generated_vs_guide_MAE": float(np.mean(slot_errors))})
+            rows.append({
+                "trend_id": trend_id, "dataset_id": metadata.iloc[index]["dataset_id"],
+                "guide_slot_count": len(generated_errors),
+                "generated_vs_guide_MAE": float(np.mean(generated_errors)),
+                "guide_vs_target_MAE": float(np.mean(target_errors)) if target_errors else np.nan,
+            })
 
     frame = pd.DataFrame(rows)
     if frame.empty:
@@ -150,6 +168,7 @@ def evaluate_guide_fidelity(dataset_dir, prediction_dir, output_dir, *, split="i
     summary = {
         "split": split, "record_count": int(len(frame)), "skipped_no_valid_guide": int(skipped_no_guide),
         "generated_vs_guide_MAE": _percentile_stats(frame["generated_vs_guide_MAE"].to_numpy()),
+        "guide_vs_target_MAE": _percentile_stats(frame["guide_vs_target_MAE"].dropna().to_numpy()),
     }
     (output_dir / "generated_vs_guide_fidelity.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",

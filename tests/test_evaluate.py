@@ -34,9 +34,18 @@ def _write_guide_fidelity_fixture(tmp_path):
 
     # t2: 有効なguideが1本も無い(評価対象から除外されるべき)。
 
+    # 正解(target): t0は2.0、t1は1.5(全月有効) — generated_vs_guideとは別の値にして、
+    # guide_vs_target_MAEが独立に正しく計算されていることを検証できるようにする。
+    target_values = np.zeros((n, 12), dtype=np.float32)
+    target_masks = np.ones((n, 12), dtype=np.float32)
+    target_values[0] = 2.0
+    target_values[1] = 1.5
+
     np.save(split_dir / "guide_values.npy", guide_values)
     np.save(split_dir / "guide_masks.npy", guide_masks)
     np.save(split_dir / "retrieval_masks.npy", retrieval_masks)
+    np.save(split_dir / "target_values.npy", target_values)
+    np.save(split_dir / "target_masks.npy", target_masks)
 
     prediction_dir = tmp_path / "pred"
     prediction_dir.mkdir(parents=True, exist_ok=True)
@@ -56,15 +65,19 @@ def test_evaluate_guide_fidelity_averages_across_valid_guide_slots(tmp_path):
     assert summary["record_count"] == 2
     assert summary["skipped_no_valid_guide"] == 1
     assert summary["generated_vs_guide_MAE"]["mean"] == pytest.approx(0.75)
+    # guide_vs_target: t0=|1.0-2.0|=1.0, t1=mean(|1.0-1.5|,|3.0-1.5|)=mean(0.5,1.5)=1.0 → 平均1.0。
+    assert summary["guide_vs_target_MAE"]["mean"] == pytest.approx(1.0)
 
     frame = pd.read_csv(tmp_path / "out" / "generated_vs_guide_fidelity_per_record.csv", encoding="utf-8-sig")
     assert set(frame["trend_id"].astype(str)) == {"t0", "t1"}
     row_t0 = frame.loc[frame["trend_id"].astype(str) == "t0"].iloc[0]
     assert row_t0["generated_vs_guide_MAE"] == pytest.approx(0.5)
     assert row_t0["guide_slot_count"] == 1
+    assert row_t0["guide_vs_target_MAE"] == pytest.approx(1.0)
     row_t1 = frame.loc[frame["trend_id"].astype(str) == "t1"].iloc[0]
     assert row_t1["generated_vs_guide_MAE"] == pytest.approx(1.0)
     assert row_t1["guide_slot_count"] == 2
+    assert row_t1["guide_vs_target_MAE"] == pytest.approx(1.0)
 
 
 def test_evaluate_guide_fidelity_raises_when_no_record_has_a_valid_guide(tmp_path):
@@ -92,6 +105,14 @@ def test_evaluate_guide_fidelity_only_averages_over_valid_guide_months(tmp_path)
     np.save(split_dir / "guide_masks.npy", guide_masks)
     np.save(split_dir / "retrieval_masks.npy", retrieval_masks)
 
+    # target_maskはguide_maskと重ならない後半だけ有効にする
+    # (guide_vs_target_MAEは「guide_mask AND target_mask」の交差が空なので対象外になるはず)。
+    target_values = np.full((1, 12), 9.0, dtype=np.float32)
+    target_masks = np.zeros((1, 12), dtype=np.float32)
+    target_masks[0, 6:] = 1.0
+    np.save(split_dir / "target_values.npy", target_values)
+    np.save(split_dir / "target_masks.npy", target_masks)
+
     prediction_dir = tmp_path / "pred"
     prediction_dir.mkdir(parents=True, exist_ok=True)
     samples = np.zeros((1, 1, 12), dtype=np.float32)
@@ -101,3 +122,7 @@ def test_evaluate_guide_fidelity_only_averages_over_valid_guide_months(tmp_path)
 
     summary = evaluate_guide_fidelity(dataset_dir, prediction_dir, tmp_path / "out3", split="inference")
     assert summary["generated_vs_guide_MAE"]["mean"] == pytest.approx(0.5)
+
+    frame = pd.read_csv(tmp_path / "out3" / "generated_vs_guide_fidelity_per_record.csv", encoding="utf-8-sig")
+    # guide_mask(前半)とtarget_mask(後半)が重ならないため、guide_vs_target_MAEは欠損(NaN)になる。
+    assert pd.isna(frame.iloc[0]["guide_vs_target_MAE"])
