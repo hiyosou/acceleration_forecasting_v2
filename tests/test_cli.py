@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pandas as pd
 
@@ -116,6 +117,19 @@ def test_cli_diagnose_guide_conditioning_runs_against_a_trained_checkpoint(tmp_p
     assert code == 0 and result["record_count"] == 8
     frame = pd.read_csv(tmp_path / "diagnose" / "condition_usage_per_target_t900.csv", encoding="utf-8-sig")
     assert len(frame) == 8
+
+
+def test_cli_plot_prediction_runs_against_a_fabricated_fixture(tmp_path, capsys):
+    from test_visualize import _write_visualize_fixture
+
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+    chosen = str(metadata.iloc[0]["trend_id"])
+
+    code, result = _run(capsys, "plot-prediction", "--dataset-dir", dataset_dir, "--split", "inference",
+                        "--prediction-dir", prediction_dir, "--artifact-dir", artifact_dir,
+                        "--output-dir", tmp_path / "out", "--trend-id", chosen)
+    assert code == 0
+    assert Path(result["output_path"]).is_file()
 
 
 def test_cli_build_self_reference_dataset_runs(tmp_path, capsys):

@@ -5,9 +5,11 @@
 パイプラインの段階そのものだけ:
   import-snapshot → build-retrieval → prepare → verify → train → predict → evaluate → compare
 
-上記のパイプライン段階に加えて、既存成果物の事後検証ツールを2つ持つ(いずれもSPEC.mdの
+上記のパイプライン段階に加えて、既存成果物の事後検証ツールを4つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
-  self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md)
+  self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md) /
+  plot-prediction(1レコードの予測結果を暦日x軸でPNG化) /
+  evaluate-guide-fidelity(生成データと検索guide自体との誤差を評価)
 """
 
 from __future__ import annotations
@@ -109,6 +111,28 @@ def _parser():
                             help="guideを自分自身の正解に差し替えたデータセットを構築(生成モジュールの上限性能測定用)")
     p.add_argument("--source-dataset-dir", required=True)
     p.add_argument("--output-dataset-dir", required=True)
+
+    p = commands.add_parser("plot-prediction",
+                            help="1レコードの予測サンプル・実測値・guide・施工マーカーを暦日x軸でPNG化")
+    p.add_argument("--dataset-dir", required=True)
+    p.add_argument("--split", default="inference")
+    p.add_argument("--prediction-dir", required=True)
+    p.add_argument("--artifact-dir", required=True, help="trend_catalog.csvを含むretrieval成果物ディレクトリ")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--trend-id", help="指定時は自動選択を迂回してこのレコードを直接描画する")
+    p.add_argument("--maintenance-relation", choices=("any", "immediately_after", "elapsed"), default="any")
+    p.add_argument("--immediately-after-months", type=float, default=2.0)
+    p.add_argument("--elapsed-months", type=float, default=6.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--bin-width", type=float, default=0.1, help="生成頻度ヒストグラムの加速度刻み幅")
+    p.add_argument("--dpi", type=int, default=150)
+
+    p = commands.add_parser("evaluate-guide-fidelity",
+                            help="生成データ(100サンプル)と検索guide自体との誤差(guide忠実度)を評価")
+    p.add_argument("--dataset-dir", required=True)
+    p.add_argument("--prediction-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--split", default="inference")
     return parser
 
 
@@ -171,6 +195,16 @@ def main(argv=None) -> int:
         result = diagnose_guide_conditioning(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split,
                                              timesteps=tuple(args.timesteps), seed=args.seed,
                                              batch_size=args.batch_size, device=args.device)
+    elif args.command == "plot-prediction":
+        from acceleration_forecasting_v2.evaluation.visualize import plot_prediction
+        result = plot_prediction(args.dataset_dir, args.prediction_dir, args.artifact_dir, args.output_dir,
+                                 split=args.split, trend_id=args.trend_id, maintenance_relation=args.maintenance_relation,
+                                 immediately_after_months=args.immediately_after_months,
+                                 elapsed_months=args.elapsed_months, seed=args.seed, bin_width=args.bin_width,
+                                 dpi=args.dpi)
+    elif args.command == "evaluate-guide-fidelity":
+        from acceleration_forecasting_v2.evaluation.evaluate import evaluate_guide_fidelity
+        result = evaluate_guide_fidelity(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split)
     else:
         from acceleration_forecasting_v2.datasets.self_reference import build_self_reference_dataset
         result = build_self_reference_dataset(args.source_dataset_dir, args.output_dataset_dir)

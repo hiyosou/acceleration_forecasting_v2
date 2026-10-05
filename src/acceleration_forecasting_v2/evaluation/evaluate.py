@@ -93,6 +93,70 @@ def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_
     return summary
 
 
+def _percentile_stats(values):
+    return {
+        "mean": float(np.mean(values)), "median": float(np.median(values)),
+        "p10": float(np.percentile(values, 10)), "p90": float(np.percentile(values, 90)),
+    }
+
+
+def evaluate_guide_fidelity(dataset_dir, prediction_dir, output_dir, *, split="inference"):
+    """生成データ(100サンプル)と、生成条件として使われた検索guide(最大3本)自体との
+    誤差(「guide忠実度」)を評価する。
+
+    正解(target)とのMAEとは異なり、「生成がどれだけguideの中身に沿っているか」を直接測る。
+    レコードごとに有効なguideスロット(retrieval_masks==1)それぞれとの誤差を計算し、
+    スロット間で平均して1レコード1値にする(有効guideが1本も無いレコードは除外)。
+    """
+    dataset_dir, prediction_dir, output_dir = Path(dataset_dir), Path(prediction_dir), Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    split_dir = dataset_dir / split
+    metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
+    guide_values = np.load(split_dir / "guide_values.npy")
+    guide_masks = np.load(split_dir / "guide_masks.npy")
+    retrieval_masks = np.load(split_dir / "retrieval_masks.npy")
+    lookup = {str(trend_id): index for index, trend_id in enumerate(metadata["trend_id"])}
+
+    with np.load(prediction_dir / "samples.npz", allow_pickle=False) as samples_npz:
+        sample_trend_ids = samples_npz["trend_ids"].astype(str)
+        samples = samples_npz["samples"]
+
+        rows, skipped_no_guide = [], 0
+        for position, trend_id in enumerate(sample_trend_ids):
+            if trend_id not in lookup:
+                continue
+            index = lookup[trend_id]
+            record_samples = samples[position]
+            slot_errors = []
+            for slot in range(guide_values.shape[1]):
+                if retrieval_masks[index, slot] <= 0:
+                    continue
+                mask = guide_masks[index, slot] > 0
+                if not mask.any():
+                    continue
+                diff = np.abs(record_samples[:, mask] - guide_values[index, slot][mask])
+                slot_errors.append(float(diff.mean()))
+            if not slot_errors:
+                skipped_no_guide += 1
+                continue
+            rows.append({"trend_id": trend_id, "dataset_id": metadata.iloc[index]["dataset_id"],
+                        "guide_slot_count": len(slot_errors), "generated_vs_guide_MAE": float(np.mean(slot_errors))})
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        raise ValueError("guide忠実度を評価できるレコードがありません(有効なguideが1本も無い)。")
+    frame.to_csv(output_dir / "generated_vs_guide_fidelity_per_record.csv", index=False, encoding="utf-8-sig")
+
+    summary = {
+        "split": split, "record_count": int(len(frame)), "skipped_no_valid_guide": int(skipped_no_guide),
+        "generated_vs_guide_MAE": _percentile_stats(frame["generated_vs_guide_MAE"].to_numpy()),
+    }
+    (output_dir / "generated_vs_guide_fidelity.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    return summary
+
+
 def build_comparison_table(summaries: dict) -> pd.DataFrame:
     """複数run(例: epsilon / v_prediction)のsummaryを、指標×(run, 集計単位)の表にまとめる。
 
