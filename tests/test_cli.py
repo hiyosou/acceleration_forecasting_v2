@@ -132,6 +132,23 @@ def test_cli_plot_prediction_runs_against_a_fabricated_fixture(tmp_path, capsys)
     assert Path(result["output_path"]).is_file()
 
 
+def test_cli_plot_prediction_batch_runs_against_fabricated_fixtures(tmp_path, capsys):
+    from test_visualize import _write_extra_prediction_dir, _write_visualize_fixture
+
+    dataset_dir, artifact_dir, prediction_dir_a, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+    prediction_dir_b = _write_extra_prediction_dir(tmp_path, metadata, name="method_b", n_inference=3, seed=1)
+
+    code, result = _run(capsys, "plot-prediction-batch", "--dataset-dir", dataset_dir, "--split", "inference",
+                        "--artifact-dir", artifact_dir, "--output-dir", tmp_path / "batch_out",
+                        "--method", f"method_a={prediction_dir_a}", "--method", f"method_b={prediction_dir_b}",
+                        "--count-per-category", 1, "--seed", 0)
+    assert code == 0
+    assert result["record_count"] == 2
+    for record in result["records"]:
+        for method_name, output_path in record["outputs"].items():
+            assert Path(output_path).is_file()
+
+
 def test_cli_build_self_reference_dataset_runs(tmp_path, capsys):
     from synthetic_artifacts import build_artifacts
 

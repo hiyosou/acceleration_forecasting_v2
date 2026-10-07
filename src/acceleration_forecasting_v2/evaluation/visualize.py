@@ -247,37 +247,31 @@ def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_
     plt.close(fig)
 
 
-def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, split="inference",
-                     trend_id=None, maintenance_relation="any", immediately_after_months=2.0,
-                     elapsed_months=6.0, seed=42, bin_width=0.1, dpi=150) -> dict:
-    """CLIから呼ばれるオーケストレーション関数。1レコードを選んでPNGを1枚書き出す。"""
-    dataset_dir, prediction_dir, artifact_dir, output_dir = (
-        Path(dataset_dir), Path(prediction_dir), Path(artifact_dir), Path(output_dir)
-    )
-    split_dir = dataset_dir / split
-    metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
-    trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
-
-    with np.load(prediction_dir / "samples.npz", allow_pickle=False) as samples_npz:
+def _load_samples_for_trend_id(prediction_dir, trend_id):
+    """prediction_dirのsamples.npzから、指定trend_id 1件分のサンプル配列を取り出す。"""
+    with np.load(Path(prediction_dir) / "samples.npz", allow_pickle=False) as samples_npz:
         sample_trend_ids = samples_npz["trend_ids"].astype(str)
-        available_trend_ids = set(sample_trend_ids)
+        positions = np.where(sample_trend_ids == trend_id)[0]
+        if len(positions) == 0:
+            raise ValueError(f"trend_id={trend_id!r} がprediction_dirのsamples.npzに見つかりません。")
+        return samples_npz["samples"][positions[0]]
 
-        selection = select_record(
-            metadata, trend_catalog, trend_id=trend_id, maintenance_relation=maintenance_relation,
-            immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
-            available_trend_ids=available_trend_ids, seed=seed,
-        )
-        chosen_trend_id = selection["trend_id"]
 
-        sample_positions = np.where(sample_trend_ids == chosen_trend_id)[0]
-        if len(sample_positions) == 0:
-            raise ValueError(f"trend_id={chosen_trend_id!r} がprediction_dirのsamples.npzに見つかりません。")
-        samples = samples_npz["samples"][sample_positions[0]]
+def _available_trend_ids(prediction_dir):
+    with np.load(Path(prediction_dir) / "samples.npz", allow_pickle=False) as samples_npz:
+        return set(samples_npz["trend_ids"].astype(str))
 
+
+def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path, *,
+                    bin_width=0.1, dpi=150):
+    """1レコード分のnpy読み込み〜PNG書き出しまでを行う、`plot_prediction`/
+    `plot_prediction_batch`共通の下請け関数。レコードの基本情報(dict)を返す。
+    """
+    split_dir = Path(split_dir)
     lookup = {str(value): index for index, value in enumerate(metadata["trend_id"])}
-    if chosen_trend_id not in lookup:
-        raise ValueError(f"trend_id={chosen_trend_id!r} がmetadata.csvに存在しません。")
-    index = lookup[chosen_trend_id]
+    if trend_id not in lookup:
+        raise ValueError(f"trend_id={trend_id!r} がmetadata.csvに存在しません。")
+    index = lookup[trend_id]
     row = metadata.iloc[index]
 
     history_values = np.load(split_dir / "history_values.npy")[index]
@@ -287,9 +281,9 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
     target_values = np.load(split_dir / "target_values.npy")[index]
     target_masks = np.load(split_dir / "target_masks.npy")[index]
 
-    catalog_rows = trend_catalog.loc[trend_catalog["trend_id"].astype(str) == chosen_trend_id]
+    catalog_rows = trend_catalog.loc[trend_catalog["trend_id"].astype(str) == trend_id]
     if catalog_rows.empty:
-        raise ValueError(f"trend_id={chosen_trend_id!r} がtrend_catalog.csvに見つかりません。")
+        raise ValueError(f"trend_id={trend_id!r} がtrend_catalog.csvに見つかりません。")
     selected_dates = json.loads(catalog_rows.iloc[0]["selected_dates"])
     forecast_dates = pd.to_datetime(selected_dates)
 
@@ -301,11 +295,8 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
     events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
     maintenance_events = events_by_segment.get((direction, bin_start_m, bin_end_m), [])
 
-    filename = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor.date()}_{chosen_trend_id}.png"
-    output_path = output_dir / filename
-
     plot_prediction_record(
-        output_path, trend_id=chosen_trend_id, dataset_id=row["dataset_id"], direction=direction,
+        output_path, trend_id=trend_id, dataset_id=row["dataset_id"], direction=direction,
         bin_start_m=bin_start_m, bin_end_m=bin_end_m, anchor_date=anchor,
         current_value=float(row["current_acc_z_max"]), history_dates=history_dates,
         history_values=history_values, history_masks=history_masks, forecast_dates=forecast_dates,
@@ -313,15 +304,129 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
         target_masks=target_masks, samples=samples, maintenance_events=maintenance_events,
         bin_width=bin_width, dpi=dpi,
     )
-
     months_since = months_since_maintenance(anchor, maintenance_events)
+    return {
+        "trend_id": trend_id, "dataset_id": str(row["dataset_id"]), "direction": direction,
+        "bin_start_m": bin_start_m, "bin_end_m": bin_end_m, "anchor_date": str(anchor.date()),
+        "months_since_maintenance": months_since, "num_samples": int(samples.shape[0]),
+    }
+
+
+def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, split="inference",
+                     trend_id=None, maintenance_relation="any", immediately_after_months=2.0,
+                     elapsed_months=6.0, seed=42, bin_width=0.1, dpi=150) -> dict:
+    """CLIから呼ばれるオーケストレーション関数。1レコードを選んでPNGを1枚書き出す。"""
+    dataset_dir, prediction_dir, artifact_dir, output_dir = (
+        Path(dataset_dir), Path(prediction_dir), Path(artifact_dir), Path(output_dir)
+    )
+    split_dir = dataset_dir / split
+    metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
+    trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+
+    selection = select_record(
+        metadata, trend_catalog, trend_id=trend_id, maintenance_relation=maintenance_relation,
+        immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
+        available_trend_ids=_available_trend_ids(prediction_dir), seed=seed,
+    )
+    chosen_trend_id = selection["trend_id"]
+    samples = _load_samples_for_trend_id(prediction_dir, chosen_trend_id)
+
+    row = metadata.loc[metadata["trend_id"].astype(str) == chosen_trend_id].iloc[0]
+    direction, bin_start_m, bin_end_m = row["direction"], float(row["bin_start_m"]), float(row["bin_end_m"])
+    anchor = pd.Timestamp(row["anchor_date"])
+    filename = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor.date()}_{chosen_trend_id}.png"
+    output_path = output_dir / filename
+
+    info = _render_record(metadata, trend_catalog, split_dir, samples, chosen_trend_id, output_path,
+                          bin_width=bin_width, dpi=dpi)
+
     maintenance_relation_for_summary = selection["maintenance_relation"] or classify_maintenance_relation(
-        months_since, immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
+        info["months_since_maintenance"], immediately_after_months=immediately_after_months,
+        elapsed_months=elapsed_months,
     )
     return {
-        "trend_id": chosen_trend_id, "dataset_id": str(row["dataset_id"]), "direction": direction,
-        "bin_start_m": bin_start_m, "bin_end_m": bin_end_m, "anchor_date": str(anchor.date()),
-        "output_path": str(output_path), "maintenance_relation": maintenance_relation_for_summary,
-        "months_since_maintenance": months_since, "selection_pool_size": selection["selection_pool_size"],
-        "num_samples": int(samples.shape[0]),
+        **info, "output_path": str(output_path), "maintenance_relation": maintenance_relation_for_summary,
+        "selection_pool_size": selection["selection_pool_size"],
+    }
+
+
+def select_records(metadata: pd.DataFrame, trend_catalog: pd.DataFrame, *, count_per_category=3,
+                    immediately_after_months=2.0, elapsed_months=6.0, available_trend_ids=None,
+                    seed=42) -> dict:
+    """「immediately_after」「elapsed」の各カテゴリから、重複なくcount_per_category件まで
+    ランダムに選ぶ(`select_record`の複数選択版)。カテゴリのプールがcount_per_category未満
+    の場合は、そのカテゴリの全件を使う(エラーにはしない、実際に選んだ件数を結果に含める)。
+
+    Returns:
+        {"immediately_after": [trend_id, ...], "elapsed": [trend_id, ...],
+        "pool_sizes": {"immediately_after": int, "elapsed": int}}
+    """
+    events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
+    pools = {"immediately_after": [], "elapsed": []}
+    for _, row in metadata.iterrows():
+        key = (row["direction"], float(row["bin_start_m"]), float(row["bin_end_m"]))
+        months = months_since_maintenance(row["anchor_date"], events_by_segment.get(key, []))
+        category = classify_maintenance_relation(
+            months, immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
+        )
+        if category is None:
+            continue
+        trend_id = str(row["trend_id"])
+        if available_trend_ids is not None and trend_id not in available_trend_ids:
+            continue
+        pools[category].append(trend_id)
+
+    rng = np.random.default_rng(seed)
+    chosen = {}
+    for category, pool in pools.items():
+        pool = sorted(pool)
+        count = min(count_per_category, len(pool))
+        chosen[category] = list(rng.choice(pool, size=count, replace=False)) if count else []
+    return {**chosen, "pool_sizes": {category: len(pool) for category, pool in pools.items()}}
+
+
+def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, *, split="inference",
+                          count_per_category=3, immediately_after_months=2.0, elapsed_months=6.0,
+                          seed=42, bin_width=0.1, dpi=150) -> dict:
+    """複数レコード×複数手法(手法名→prediction_dirの対応表)を一括生成する。
+
+    出力は`output_dir/<trend_id>/<手法名>.png`(レコードごとにフォルダ、同一レコードの
+    手法間比較がしやすい構成、2026-10-07にユーザーと決定)。レコードは区間の施工記録から
+    「直後」「経過」それぞれcount_per_category件ずつランダム選択し、全手法の
+    prediction_dirに共通して存在するtrend_idだけを対象にする(どれか1つでも欠けている
+    レコードは選ばない)。
+    """
+    dataset_dir, artifact_dir, output_dir = Path(dataset_dir), Path(artifact_dir), Path(output_dir)
+    split_dir = dataset_dir / split
+    metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
+    trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+
+    available_per_method = {name: _available_trend_ids(path) for name, path in methods.items()}
+    common_available = set.intersection(*available_per_method.values()) if available_per_method else set()
+
+    selection = select_records(
+        metadata, trend_catalog, count_per_category=count_per_category,
+        immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
+        available_trend_ids=common_available, seed=seed,
+    )
+    selected_trend_ids = [
+        (trend_id, category) for category in ("immediately_after", "elapsed") for trend_id in selection[category]
+    ]
+
+    records = []
+    for trend_id, category in selected_trend_ids:
+        record_dir = output_dir / trend_id
+        outputs = {}
+        for method_name, prediction_dir in methods.items():
+            samples = _load_samples_for_trend_id(prediction_dir, trend_id)
+            output_path = record_dir / f"{method_name}.png"
+            info = _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path,
+                                  bin_width=bin_width, dpi=dpi)
+            outputs[method_name] = str(output_path)
+        records.append({"trend_id": trend_id, "maintenance_relation": category,
+                        "months_since_maintenance": info["months_since_maintenance"], "outputs": outputs})
+
+    return {
+        "split": split, "methods": list(methods), "record_count": len(records),
+        "pool_sizes": selection["pool_sizes"], "records": records,
     }

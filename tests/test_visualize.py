@@ -17,10 +17,12 @@ from acceleration_forecasting_v2.evaluation.visualize import (
     compute_fixed_bins,
     months_since_maintenance,
     plot_prediction,
+    plot_prediction_batch,
     reconstruct_segment_maintenance_events,
     render_generation_histogram,
     render_quartile_band,
     select_record,
+    select_records,
 )
 
 
@@ -176,6 +178,59 @@ def test_select_record_custom_thresholds_shift_classification():
     assert result["selection_pool_size"] == 2
 
 
+# --- select_records(複数選択版) --------------------------------------------------------------
+
+def _segment_metadata_and_catalog_many():
+    # 1区間、施工イベント1件(2023-01-01)。immediately_after候補2件・elapsed候補3件。
+    rows = [
+        {"trend_id": "a1", "anchor_date": "2023-01-05"},   # 4日後、immediately_after
+        {"trend_id": "a2", "anchor_date": "2023-01-20"},   # 19日後、immediately_after
+        {"trend_id": "e1", "anchor_date": "2023-07-10"},   # elapsed
+        {"trend_id": "e2", "anchor_date": "2023-08-10"},   # elapsed
+        {"trend_id": "e3", "anchor_date": "2023-09-10"},   # elapsed
+    ]
+    for row in rows:
+        row.update({"direction": "D", "bin_start_m": 0.0, "bin_end_m": 100.0})
+    metadata = _metadata_frame(rows)
+    catalog = _trend_catalog_frame([
+        {"dataset_id": "seg_001", "direction": "D", "bin_start_m": 0.0, "bin_end_m": 100.0,
+         "cutoff_maintenance_date": "2023-01-01", "maintenance_type": "real", "maintenance_description": "工事"},
+    ])
+    return metadata, catalog
+
+
+def test_select_records_picks_up_to_count_per_category():
+    metadata, catalog = _segment_metadata_and_catalog_many()
+    result = select_records(metadata, catalog, count_per_category=2, seed=0)
+    assert len(result["immediately_after"]) == 2
+    assert set(result["immediately_after"]) == {"a1", "a2"}
+    assert len(result["elapsed"]) == 2
+    assert set(result["elapsed"]) <= {"e1", "e2", "e3"}
+    assert result["pool_sizes"] == {"immediately_after": 2, "elapsed": 3}
+
+
+def test_select_records_uses_all_available_when_pool_smaller_than_requested():
+    metadata, catalog = _segment_metadata_and_catalog_many()
+    result = select_records(metadata, catalog, count_per_category=10, seed=0)
+    assert set(result["immediately_after"]) == {"a1", "a2"}
+    assert set(result["elapsed"]) == {"e1", "e2", "e3"}
+
+
+def test_select_records_filters_by_available_trend_ids():
+    metadata, catalog = _segment_metadata_and_catalog_many()
+    result = select_records(metadata, catalog, count_per_category=10,
+                            available_trend_ids={"a1", "e1", "e2"}, seed=0)
+    assert set(result["immediately_after"]) == {"a1"}
+    assert set(result["elapsed"]) == {"e1", "e2"}
+
+
+def test_select_records_is_deterministic_for_a_fixed_seed():
+    metadata, catalog = _segment_metadata_and_catalog_many()
+    first = select_records(metadata, catalog, count_per_category=1, seed=3)
+    second = select_records(metadata, catalog, count_per_category=1, seed=3)
+    assert first == second
+
+
 # --- compute_fixed_bins -----------------------------------------------------------------------
 
 def test_compute_fixed_bins_covers_the_range_with_bin_width_increments():
@@ -290,3 +345,40 @@ def test_plot_prediction_renders_a_png_with_maintenance_relation_elapsed(tmp_pat
     output_path = Path(result["output_path"])
     assert output_path.is_file() and output_path.stat().st_size > 0
     assert result["maintenance_relation"] == "elapsed"
+
+
+# --- plot_prediction_batch(スモークテスト) ----------------------------------------------------
+
+def _write_extra_prediction_dir(tmp_path, metadata, *, name, n_inference, seed):
+    prediction_dir = tmp_path / name
+    prediction_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    samples = rng.normal(loc=1.5, scale=0.2, size=(n_inference, 10, 12)).astype(np.float32)
+    np.savez_compressed(
+        prediction_dir / "samples.npz",
+        trend_ids=metadata["trend_id"].astype(str).to_numpy().astype("U"), samples=samples,
+    )
+    return prediction_dir
+
+
+def test_plot_prediction_batch_creates_one_folder_per_record_with_one_png_per_method(tmp_path):
+    dataset_dir, artifact_dir, prediction_dir_a, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+    prediction_dir_b = _write_extra_prediction_dir(tmp_path, metadata, name="method_b", n_inference=3, seed=1)
+
+    result = plot_prediction_batch(
+        dataset_dir, artifact_dir, tmp_path / "batch_out",
+        methods={"method_a": str(prediction_dir_a), "method_b": str(prediction_dir_b)},
+        split="inference", count_per_category=1, seed=0,
+    )
+
+    # fixtureのanchor_dates(2023-01-11/2023-07-20/2023-03-22)はそれぞれ
+    # immediately_after 1件・elapsed 1件・どちらでもない1件、になる設計(他のテストと同じ前提)。
+    assert result["record_count"] == 2
+    assert set(result["methods"]) == {"method_a", "method_b"}
+    for record in result["records"]:
+        record_dir = tmp_path / "batch_out" / record["trend_id"]
+        assert record_dir.is_dir()
+        for method_name in ("method_a", "method_b"):
+            output_path = Path(record["outputs"][method_name])
+            assert output_path.parent == record_dir
+            assert output_path.is_file() and output_path.stat().st_size > 0

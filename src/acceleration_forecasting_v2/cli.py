@@ -5,10 +5,11 @@
 パイプラインの段階そのものだけ:
   import-snapshot → build-retrieval → prepare → verify → train → predict → evaluate → compare
 
-上記のパイプライン段階に加えて、既存成果物の事後検証ツールを4つ持つ(いずれもSPEC.mdの
+上記のパイプライン段階に加えて、既存成果物の事後検証ツールを5つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
   self-check(SELF_RETRIEVAL_CHECK.md) / diagnose-guide-conditioning(SELF_GUIDE_CHECK.md) /
   plot-prediction(1レコードの予測結果を暦日x軸でPNG化) /
+  plot-prediction-batch(複数レコード×複数手法のplot-predictionを一括生成) /
   evaluate-guide-fidelity(生成データと検索guide自体との誤差を評価)
 """
 
@@ -127,6 +128,22 @@ def _parser():
     p.add_argument("--bin-width", type=float, default=0.1, help="生成頻度ヒストグラムの加速度刻み幅")
     p.add_argument("--dpi", type=int, default=150)
 
+    p = commands.add_parser("plot-prediction-batch",
+                            help="複数レコード×複数手法のplot-predictionを一括生成(レコードごとにフォルダ)")
+    p.add_argument("--dataset-dir", required=True)
+    p.add_argument("--split", default="inference")
+    p.add_argument("--artifact-dir", required=True, help="trend_catalog.csvを含むretrieval成果物ディレクトリ")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--method", action="append", required=True, metavar="NAME=PREDICTION_DIR",
+                   help="手法名=prediction_dir。複数指定可(例: --method initial_retrieved=... --method improved_self_target=...)")
+    p.add_argument("--count-per-category", type=int, default=3,
+                   help="immediately_after/elapsedそれぞれから選ぶレコード数")
+    p.add_argument("--immediately-after-months", type=float, default=2.0)
+    p.add_argument("--elapsed-months", type=float, default=6.0)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--bin-width", type=float, default=0.1)
+    p.add_argument("--dpi", type=int, default=150)
+
     p = commands.add_parser("evaluate-guide-fidelity",
                             help="生成データ(100サンプル)と検索guide自体との誤差(guide忠実度)を評価")
     p.add_argument("--dataset-dir", required=True)
@@ -202,6 +219,17 @@ def main(argv=None) -> int:
                                  immediately_after_months=args.immediately_after_months,
                                  elapsed_months=args.elapsed_months, seed=args.seed, bin_width=args.bin_width,
                                  dpi=args.dpi)
+    elif args.command == "plot-prediction-batch":
+        from acceleration_forecasting_v2.evaluation.visualize import plot_prediction_batch
+        methods = {}
+        for item in args.method:
+            name, _, directory = item.partition("=")
+            methods[name] = directory
+        result = plot_prediction_batch(args.dataset_dir, args.artifact_dir, args.output_dir, methods,
+                                       split=args.split, count_per_category=args.count_per_category,
+                                       immediately_after_months=args.immediately_after_months,
+                                       elapsed_months=args.elapsed_months, seed=args.seed,
+                                       bin_width=args.bin_width, dpi=args.dpi)
     elif args.command == "evaluate-guide-fidelity":
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate_guide_fidelity
         result = evaluate_guide_fidelity(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split)
