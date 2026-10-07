@@ -13,11 +13,21 @@ ForecastDatasetV2/Normalizationは使わず、evaluation/evaluate.py::per_target
 一定(1つのdataset_id=1つの施工間隔、`retrieval/trends.py`参照)なので、区間
 (direction, bin_start_m, bin_end_m)ごとにdataset_id単位でユニークな値を集めれば、
 その区間の施工イベント履歴を復元できる。
+
+2026-10-07追加: 旧リポジトリの`plot_target`にあった「区間の全実測値(走行速度で色分け)」
+散布図を再現する。v2では元の抽出スナップショットを直接保存していないが、
+`artifacts/retrieval/vector_database.sqlite`の`trends`テーブル(measurement_date・
+current_acc_z_max)と`waveform_records`テーブル(mean_velocity_kmh、trend_id単位で
+複数行ありうるので平均する)を`direction`+`bin_start_m`でjoinすれば再構築できる
+(実データで確認済み)。速度レンジでの絞り込みは行わない(旧リポジトリのevaluate.py側の
+呼び出し時フィルタであり、plot_target自体の挙動ではないため、ここでは区間の全実測値を
+そのまま見せる)。
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
 import matplotlib
@@ -29,6 +39,51 @@ import numpy as np
 import pandas as pd
 
 from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
+
+
+def load_segment_measurement_history(database_path, direction, bin_start_m) -> pd.DataFrame:
+    """区間(direction, bin_start_m)の全実測値を`vector_database.sqlite`から読み込む。
+
+    Returns:
+        列`measurement_date`(datetime64)・`current_acc_z_max`(float)・`velocity`
+        (float、走行速度[km/h]の平均。該当する`waveform_records`が無い場合はNaN)を持つ
+        DataFrame。
+    """
+    connection = sqlite3.connect(f"file:{Path(database_path).resolve().as_posix()}?mode=ro", uri=True)
+    try:
+        trends = pd.read_sql_query(
+            "SELECT trend_id, measurement_date, current_acc_z_max FROM trends "
+            "WHERE direction = ? AND bin_start_m = ?",
+            connection, params=(direction, float(bin_start_m)),
+        )
+        velocity = pd.read_sql_query(
+            "SELECT trend_id, AVG(mean_velocity_kmh) AS velocity FROM waveform_records "
+            "WHERE direction = ? AND bin_start_m = ? GROUP BY trend_id",
+            connection, params=(direction, float(bin_start_m)),
+        )
+    finally:
+        connection.close()
+    trends["measurement_date"] = pd.to_datetime(trends["measurement_date"], errors="coerce")
+    return trends.merge(velocity, on="trend_id", how="left")
+
+
+def render_measurement_history(ax, measurement_history: pd.DataFrame, *, vmin=0.0, vmax=100.0):
+    """区間の全実測値を、走行速度で色分けした散布図として背景に描画する(旧リポジトリの
+    `plot_target`の「全実測値」要素を再現)。速度が不明な点はグレーで描く。
+    """
+    has_velocity = measurement_history["velocity"].notna()
+    scatter = None
+    if has_velocity.any():
+        subset = measurement_history.loc[has_velocity]
+        scatter = ax.scatter(
+            subset["measurement_date"], subset["current_acc_z_max"], c=subset["velocity"],
+            cmap="jet", vmin=vmin, vmax=vmax, s=24, alpha=0.7, label="全実測値", zorder=0,
+        )
+    if (~has_velocity).any():
+        subset = measurement_history.loc[~has_velocity]
+        ax.scatter(subset["measurement_date"], subset["current_acc_z_max"], color="0.55", s=24,
+                  alpha=0.6, label="全実測値(速度欠損)", zorder=0)
+    return scatter
 
 
 def reconstruct_segment_maintenance_events(trend_catalog: pd.DataFrame) -> dict:
@@ -180,8 +235,12 @@ def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_
                             anchor_date, current_value, history_dates, history_values, history_masks,
                             forecast_dates, guide_values, guide_masks, target_values, target_masks,
                             samples, maintenance_events, bin_width=0.1,
-                            y_bounds=(PHYSICAL_MIN, PHYSICAL_MAX), dpi=150):
-    """1枚のmatplotlib図を組み立てて保存する。"""
+                            y_bounds=(PHYSICAL_MIN, PHYSICAL_MAX), dpi=150, measurement_history=None):
+    """1枚のmatplotlib図を組み立てて保存する。
+
+    measurement_history: `load_segment_measurement_history`が返す形のDataFrame(省略時は
+    描画しない)。区間の全実測値(走行速度で色分け)を背景に重ねる。
+    """
     plt.rcParams["font.family"] = "MS Gothic"
     history_dates = pd.DatetimeIndex(history_dates)
     forecast_dates = pd.DatetimeIndex(forecast_dates)
@@ -194,6 +253,12 @@ def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_
     fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
     fig.patch.set_alpha(0.0)
     ax.set_facecolor("none")
+
+    if measurement_history is not None and not measurement_history.empty:
+        scatter = render_measurement_history(ax, measurement_history)
+        if scatter is not None:
+            colorbar = fig.colorbar(scatter, ax=ax, pad=0.01)
+            colorbar.set_label("走行速度 [km/h]")
 
     history_valid = np.asarray(history_masks) > 0
     ax.plot(history_dates[history_valid], history_values[history_valid], "o-", color="tab:blue",
@@ -263,9 +328,13 @@ def _available_trend_ids(prediction_dir):
 
 
 def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path, *,
-                    bin_width=0.1, dpi=150):
+                    bin_width=0.1, dpi=150, database_path=None):
     """1レコード分のnpy読み込み〜PNG書き出しまでを行う、`plot_prediction`/
     `plot_prediction_batch`共通の下請け関数。レコードの基本情報(dict)を返す。
+
+    database_path: 指定時は`vector_database.sqlite`から区間の全実測値を読み込んで
+    背景に重ねる(省略時はこれまで通り描画しない)。読み込みに失敗しても(DBが無い等)
+    プロット自体は失敗させない(全実測値は無しとして続行し、理由を標準エラーに出す)。
     """
     split_dir = Path(split_dir)
     lookup = {str(value): index for index, value in enumerate(metadata["trend_id"])}
@@ -295,6 +364,15 @@ def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output
     events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
     maintenance_events = events_by_segment.get((direction, bin_start_m, bin_end_m), [])
 
+    measurement_history = None
+    if database_path is not None:
+        try:
+            measurement_history = load_segment_measurement_history(database_path, direction, bin_start_m)
+        except Exception as error:  # DBが無い・壊れている等でも全実測値抜きで続行する
+            import sys
+            print(f"警告: 全実測値の読み込みに失敗しました({error!r})。この要素なしで描画します。",
+                 file=sys.stderr)
+
     plot_prediction_record(
         output_path, trend_id=trend_id, dataset_id=row["dataset_id"], direction=direction,
         bin_start_m=bin_start_m, bin_end_m=bin_end_m, anchor_date=anchor,
@@ -302,7 +380,7 @@ def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output
         history_values=history_values, history_masks=history_masks, forecast_dates=forecast_dates,
         guide_values=guide_values, guide_masks=guide_masks, target_values=target_values,
         target_masks=target_masks, samples=samples, maintenance_events=maintenance_events,
-        bin_width=bin_width, dpi=dpi,
+        bin_width=bin_width, dpi=dpi, measurement_history=measurement_history,
     )
     months_since = months_since_maintenance(anchor, maintenance_events)
     return {
@@ -337,8 +415,10 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
     filename = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor.date()}_{chosen_trend_id}.png"
     output_path = output_dir / filename
 
+    database_path = artifact_dir / "vector_database.sqlite"
     info = _render_record(metadata, trend_catalog, split_dir, samples, chosen_trend_id, output_path,
-                          bin_width=bin_width, dpi=dpi)
+                          bin_width=bin_width, dpi=dpi,
+                          database_path=database_path if database_path.is_file() else None)
 
     maintenance_relation_for_summary = selection["maintenance_relation"] or classify_maintenance_relation(
         info["months_since_maintenance"], immediately_after_months=immediately_after_months,
@@ -413,6 +493,9 @@ def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, 
         (trend_id, category) for category in ("immediately_after", "elapsed") for trend_id in selection[category]
     ]
 
+    database_path = artifact_dir / "vector_database.sqlite"
+    database_path = database_path if database_path.is_file() else None
+
     records = []
     for trend_id, category in selected_trend_ids:
         record_dir = output_dir / trend_id
@@ -421,7 +504,7 @@ def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, 
             samples = _load_samples_for_trend_id(prediction_dir, trend_id)
             output_path = record_dir / f"{method_name}.png"
             info = _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path,
-                                  bin_width=bin_width, dpi=dpi)
+                                  bin_width=bin_width, dpi=dpi, database_path=database_path)
             outputs[method_name] = str(output_path)
         records.append({"trend_id": trend_id, "maintenance_relation": category,
                         "months_since_maintenance": info["months_since_maintenance"], "outputs": outputs})

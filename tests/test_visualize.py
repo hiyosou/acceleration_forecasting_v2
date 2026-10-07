@@ -1,6 +1,7 @@
 """evaluation.visualize の単体テスト(予測結果の可視化、plot-prediction)。"""
 
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,11 +16,13 @@ from acceleration_forecasting_v2.datasets.build import write_dataset
 from acceleration_forecasting_v2.evaluation.visualize import (
     classify_maintenance_relation,
     compute_fixed_bins,
+    load_segment_measurement_history,
     months_since_maintenance,
     plot_prediction,
     plot_prediction_batch,
     reconstruct_segment_maintenance_events,
     render_generation_histogram,
+    render_measurement_history,
     render_quartile_band,
     select_record,
     select_records,
@@ -279,6 +282,80 @@ def test_render_quartile_band_matches_numpy_percentile():
     np.testing.assert_allclose(ax.lines[0].get_ydata(), expected_q1)
     np.testing.assert_allclose(ax.lines[1].get_ydata(), expected_q3)
     plt.close(fig)
+
+
+# --- load_segment_measurement_history / render_measurement_history -----------------------------
+
+def _write_tiny_vector_database(path, rows):
+    """rowsは(trend_id, measurement_date, current_acc_z_max, direction, bin_start_m,
+    bin_end_m, velocity_or_None)のタプル列。velocityがNoneの行はwaveform_recordsに
+    何も入れない(=速度欠損として扱われるべきレコード)。
+    """
+    from acceleration_forecasting_v2.retrieval.database import SCHEMA
+
+    connection = sqlite3.connect(str(path))
+    connection.executescript(SCHEMA)
+    seen_trend_ids = set()
+    for index, (trend_id, date, acc, direction, bin_start_m, bin_end_m, velocity) in enumerate(rows):
+        if trend_id not in seen_trend_ids:
+            seen_trend_ids.add(trend_id)
+            connection.execute(
+                "INSERT INTO trends (trend_id, dataset_id, model_split, measurement_date, direction, "
+                "bin_start_m, bin_end_m, current_acc_z_max, future_values, future_mask, selected_dates, "
+                "guide_available_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (trend_id, "d0", "model_train", date, direction, bin_start_m, bin_end_m, acc,
+                 "[]", "[]", "[]", "2099-01-01"),
+            )
+        if velocity is not None:
+            connection.execute(
+                "INSERT INTO waveform_records (record_id, measurement_id, measurement_date, direction, "
+                "bin_start_m, bin_end_m, mean_velocity_kmh, source_csv_path, waveform_sha256, dataset_id, "
+                "trend_id, embedding, embedding_dim) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (f"r{index}", f"m{index}", date, direction, bin_start_m, bin_end_m, velocity,
+                 "x.csv", "sha", "d0", trend_id, b"\x00\x00\x00\x00", 1),
+            )
+    connection.commit()
+    connection.close()
+
+
+def test_load_segment_measurement_history_averages_velocity_and_filters_by_segment(tmp_path):
+    db_path = tmp_path / "vector_database.sqlite"
+    _write_tiny_vector_database(db_path, [
+        ("t0", "2023-01-01", 1.0, "D", 0.0, 100.0, 60.0),
+        ("t0", "2023-01-01", 1.0, "D", 0.0, 100.0, 80.0),  # t0と同じ日に2本→平均70.0
+        ("t1", "2023-02-01", 1.5, "D", 0.0, 100.0, None),  # 速度欠損
+        ("t2", "2023-03-01", 2.0, "U", 0.0, 100.0, 50.0),  # 別区間(direction違い)、対象外
+    ])
+    history = load_segment_measurement_history(db_path, "D", 0.0)
+    assert set(history["trend_id"]) == {"t0", "t1"}
+    row_t0 = history.loc[history["trend_id"] == "t0"].iloc[0]
+    assert row_t0["velocity"] == pytest.approx(70.0)
+    row_t1 = history.loc[history["trend_id"] == "t1"].iloc[0]
+    assert pd.isna(row_t1["velocity"])
+
+
+def test_render_measurement_history_draws_colored_and_gray_scatter_separately():
+    fig, ax = plt.subplots()
+    history = pd.DataFrame({
+        "trend_id": ["a", "b"], "measurement_date": pd.to_datetime(["2023-01-01", "2023-02-01"]),
+        "current_acc_z_max": [1.0, 2.0], "velocity": [60.0, np.nan],
+    })
+    scatter = render_measurement_history(ax, history)
+    assert scatter is not None  # 速度ありの点が1件以上あるので、色分け散布図のartistが返る
+    assert len(ax.collections) == 2  # 色分け分1つ + グレー分1つ
+    plt.close(fig)
+
+
+def test_plot_prediction_includes_measurement_history_when_database_path_is_given(tmp_path):
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+    row = metadata.iloc[0]
+    _write_tiny_vector_database(artifact_dir / "vector_database.sqlite", [
+        (str(row["trend_id"]), str(row["anchor_date"]), 1.0, "D", 0.0, 100.0, 60.0),
+    ])
+    result = plot_prediction(dataset_dir, prediction_dir, artifact_dir, tmp_path / "out_hist",
+                             split="inference", trend_id=str(row["trend_id"]))
+    output_path = Path(result["output_path"])
+    assert output_path.is_file() and output_path.stat().st_size > 0
 
 
 # --- plot_prediction(スモークテスト、モデル・学習・DDIMは一切使わない) ------------------------
