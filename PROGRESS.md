@@ -1245,3 +1245,97 @@ checkpointも同じ呼び出しで正しく読み込めるようになった)。
 - 判定: GO(実装・実行・記録完了)。guideの質そのもの(実guideと正解との相関を直接測る、
   当初「優先度1」として提案していた診断)を実行すれば、この「わずかな追従」が天井に近い
   のか、まだ伸びしろがあるのかを切り分けられる。次の一手はユーザーの判断を仰ぐ。
+
+---
+
+## [2026-10-08] 検索方法の変更(6か月履歴ベースのguide検索)を検証 — モデル・正規化は不変
+
+### 背景・目的
+
+前回(本日1つ目のエントリ以前)の結論: 「改善モデルは正解を与えれば使い切れるが、実guide
+に対してはほぼ無反応」。これが「検索したguide自体が正解とずれているため」なのか
+「生成モジュールがguideを(質によらず)活用できていないため」なのかを切り分けるため、
+ユーザー判断により**検索方法だけ**を変更して検証する: 現行は直近の生データ波形
+(autoencoder embedding, 256→64次元)のコサイン類似度で検索しているが、これを
+**モデルの生成条件そのものである6か月履歴(history_values、6点)の類似度**に変更する。
+
+「モデル・条件は一緫」を厳密に保つため、以下の設計で実施(ユーザー承認済み):
+- history_values/target_values/segment_weights、正規化統計
+  (condition_normalization.json/target_normalization.json)、model_train/model_validation
+  は一切変更せず既存データセット(`artifacts/dataset`)からそのまま引き継ぐ。
+- 作り直すのは`inference` splitのguide関連配列だけ。
+- 検索対象の候補プールは現行と揃える(`waveform_records JOIN trends`のまま)。
+
+### 実装
+
+- `retrieval/search.py`: `GuideIndex`に`search_by_history`を追加。候補プール各行について
+  自身のdataset_id内での6か月履歴(`datasets.history.build_history_window`と同じ計算)を
+  事前計算して保持し、類似度は「両者ともmask=1の月だけを使った負のRMSE」(重なりが
+  `min_history_overlap_months`(既定3)未満の候補は除外)。allowed_splits・同一dataset_id
+  除外・空間/時間リーク制約など既存の安全策は`search`と共通化(`_eligibility`/`_select`に
+  リファクタ)し、変更したのは類似度の入力だけ。
+  - 実装当初、候補行(335,986件の`waveform_records`、同一trend_idの重複込み)全件に
+    素朴に履歴計算を適用すると約1時間かかると判明。trend_id単位(91,011件)でキャッシュする
+    最適化を入れ、実データで約12分に短縮(ベンチマークで実測)。
+- `datasets/history_search_dataset.py`(新規): `datasets.self_reference`と同じ「既存
+  データセットの一部だけ差し替えて書き出す」設計で、`inference` splitのguideだけを
+  `search_by_history`で作り直す`build_history_search_inference_dataset`を実装。
+- テスト: `test_guide_search_history.py`(履歴ベクトル構築・ランキング・重なり除外・
+  split制約)、`test_history_search_dataset.py`(既存データセットとの差分が意図通りか)を
+  新規追加。root `tests/`全体295件pass(既存分含む)。
+- CLIサブコマンドは追加していない(実験ごとにサブコマンドを増やさない方針。
+  `build_history_search_inference_dataset`を直接呼ぶ一度限りのスクリプトで実行)。
+
+### 実行: 実データでの検証
+
+`artifacts/dataset`(現行、1,119件のinference anchor全件)に対し、`artifacts/retrieval`の
+`vector_database.sqlite`から`search_by_history`でguideを作り直し(`search_config`は
+`top_k=3`・`max_current_difference=0.5`・`min_valid_months=8`など現行のデフォルトのまま、
+`min_history_overlap_months=3`のみ新規)、`artifacts/dataset_history_search`を構築。
+全1,119件でguideが見つかった(現行と同数、カバレッジの低下なし)。
+
+既存チェックポイント(`artifacts/runs_self_target_aux_loss/epsilon/model/best_model.pt`、
+再学習なし)でDDIM予測(num_samples=100, sampling_steps=50, seed=42、現行と同一条件)を実行し、
+`evaluate`・`evaluate-guide-fidelity`で比較。
+
+#### guide自体の質(モデルに一切依存しないデータのみの指標)
+
+| 指標 | 現行(embedding検索) | 新(6か月履歴検索) | 変化 |
+|---|---|---|---|
+| guide_vs_target_MAE(平均/中央値) | 0.3641 / 0.3443 | 0.2664 / 0.2331 | **-27% / -32%** |
+| guide_baseline(softmax加重平均) vs target MAE(record-level) | 0.3151 | 0.2487 | **-21%** |
+| generated_vs_guide_MAE(平均/中央値、生成がguideにどれだけ追従しているか) | 0.4137 / 0.3945 | 0.3182 / 0.2993 | **-23% / -24%** |
+
+レコード単位のペアワイズ比較(guide_vs_target_MAE、1,119件)でも819件(73%)で改善、
+300件(27%)で悪化、平均改善幅-0.098。方向も大きさも明確な改善。
+
+#### 生成結果そのもの(正解targetとのMAE/相関、record-level)
+
+| 指標 | 現行 | 新 | 変化 |
+|---|---|---|---|
+| MAE | 0.2131 | 0.2135 | ほぼ無変化(+0.0004) |
+| RMSE | 0.2600 | 0.2603 | ほぼ無変化 |
+| correlation | 0.3001 | 0.2907 | わずかに悪化(-0.0094) |
+| peak_value_error | 0.2500 | 0.2516 | ほぼ無変化 |
+| direction_sign_agreement | 0.5360 | 0.5283 | わずかに悪化 |
+
+### 解釈
+
+- 「検索方法を変えればguide自体の質が改善するか」という問いには明確にYESと言える結果になった
+  (guide_vs_target_MAEで-27%、過去の`self_target_loss_weight`実験の改善幅3.5〜4%よりずっと
+  大きい)。
+- 一方、「guideの質が改善すれば最終的な生成精度(MAE・correlation)も改善するか」には
+  明確にNOという結果になった——むしろcorrelation・direction_sign_agreementはわずかに悪化
+  している(誤差範囲内とみられる程度だが、改善方向の兆候すら無い)。
+- generated_vs_guide_MAEとguide_vs_target_MAEの差(「生成がguideからどれだけ余分にずれるか」)
+  は、現行(0.4137-0.3641=0.0496)と新方式(0.3182-0.2664=0.0518)でほぼ同じ——生成は
+  与えられたguideに対して一定の(guideの質によらない)追従度を保っているが、最終的に
+  正解に近づけるだけの精度には変換されていない。
+- 以上から、2026-10-05時点で優先度1としていた「guideの質そのもの」の診断の答えが出た:
+  **guideの質は(検索方法の変更で)改善可能であり、ボトルネックは主に生成モジュール側に
+  ある**(guide品質を上げても最終出力が動かないため)。[[accel_forecasting_v2_guide_quality_hypothesis]]
+  で挙げていた「retrieval quality自体がボトルネック」という対立仮説は、少なくとも
+  「retrieval qualityを改善するだけでは最終精度は動かない」という形で後退し、
+  生成モジュール(RMA本体・条件融合・学習方法)側の改善が引き続き本筋の調査対象になる。
+- 判定: 実装・実行・記録完了。次の一手(生成モジュール側のどこに手を入れるか)は
+  ユーザーの判断を仰ぐ。
