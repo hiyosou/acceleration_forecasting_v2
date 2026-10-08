@@ -127,6 +127,8 @@ def _parser():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--bin-width", type=float, default=0.1, help="生成頻度ヒストグラムの加速度刻み幅")
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--min-target-range", type=float,
+                   help="予測期間(12か月、有効な月のみ)の最大値-最小値がこの値以上のレコードだけ自動選択対象にする")
 
     p = commands.add_parser("plot-prediction-batch",
                             help="複数レコード×複数手法のplot-predictionを一括生成(レコードごとにフォルダ)")
@@ -138,11 +140,14 @@ def _parser():
                    help="手法名=prediction_dir。複数指定可(例: --method initial_retrieved=... --method improved_self_target=...)")
     p.add_argument("--count-per-category", type=int, default=3,
                    help="immediately_after/elapsedそれぞれから選ぶレコード数")
+    p.add_argument("--maintenance-relation", choices=("any", "immediately_after", "elapsed"), default="any")
     p.add_argument("--immediately-after-months", type=float, default=2.0)
     p.add_argument("--elapsed-months", type=float, default=6.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--bin-width", type=float, default=0.1)
     p.add_argument("--dpi", type=int, default=150)
+    p.add_argument("--min-target-range", type=float,
+                   help="予測期間(12か月、有効な月のみ)の最大値-最小値がこの値以上のレコードだけ選択対象プールに残す")
 
     p = commands.add_parser("evaluate-guide-fidelity",
                             help="生成データ(100サンプル)と検索guide自体との誤差(guide忠実度)を評価")
@@ -218,7 +223,7 @@ def main(argv=None) -> int:
                                  split=args.split, trend_id=args.trend_id, maintenance_relation=args.maintenance_relation,
                                  immediately_after_months=args.immediately_after_months,
                                  elapsed_months=args.elapsed_months, seed=args.seed, bin_width=args.bin_width,
-                                 dpi=args.dpi)
+                                 dpi=args.dpi, min_target_range=args.min_target_range)
     elif args.command == "plot-prediction-batch":
         from acceleration_forecasting_v2.evaluation.visualize import plot_prediction_batch
         methods = {}
@@ -227,9 +232,11 @@ def main(argv=None) -> int:
             methods[name] = directory
         result = plot_prediction_batch(args.dataset_dir, args.artifact_dir, args.output_dir, methods,
                                        split=args.split, count_per_category=args.count_per_category,
+                                       maintenance_relation=args.maintenance_relation,
                                        immediately_after_months=args.immediately_after_months,
                                        elapsed_months=args.elapsed_months, seed=args.seed,
-                                       bin_width=args.bin_width, dpi=args.dpi)
+                                       bin_width=args.bin_width, dpi=args.dpi,
+                                       min_target_range=args.min_target_range)
     elif args.command == "evaluate-guide-fidelity":
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate_guide_fidelity
         result = evaluate_guide_fidelity(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split)

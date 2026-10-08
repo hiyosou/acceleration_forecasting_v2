@@ -15,19 +15,24 @@ ForecastDatasetV2/Normalizationは使わず、evaluation/evaluate.py::per_target
 その区間の施工イベント履歴を復元できる。
 
 2026-10-07追加: 旧リポジトリの`plot_target`にあった「区間の全実測値(走行速度で色分け)」
-散布図を再現する。v2では元の抽出スナップショットを直接保存していないが、
-`artifacts/retrieval/vector_database.sqlite`の`trends`テーブル(measurement_date・
-current_acc_z_max)と`waveform_records`テーブル(mean_velocity_kmh、trend_id単位で
-複数行ありうるので平均する)を`direction`+`bin_start_m`でjoinすれば再構築できる
-(実データで確認済み)。速度レンジでの絞り込みは行わない(旧リポジトリのevaluate.py側の
+散布図を再現する。速度レンジでの絞り込みは行わない(旧リポジトリのevaluate.py側の
 呼び出し時フィルタであり、plot_target自体の挙動ではないため、ここでは区間の全実測値を
 そのまま見せる)。
+
+2026-10-08改訂: 当初`artifacts/retrieval/vector_database.sqlite`の`trends`/
+`waveform_records`テーブルから全実測値・走行速度を読んでいたが、どちらも
+`model_split`が`model_train`/`model_validation`のレコードしか含まない(リーク防止の
+ため、検索guide用の埋め込みDBに推論対象自身のデータを入れていない)。そのため描画対象
+レコード自身の入力・出力期間(inference split)が丸ごと空白になる不具合があった。
+データソースを、train/validation/inference全splitを含む`trend_catalog.csv`
+(current_acc_z_max)と`split_manifest.csv`(mean_velocity_kmh、`import-snapshot`で
+生成される元manifest)に変更した(どちらも全split分を含み、速度が本来欠損する理由は
+無い——ユーザー指摘、PROGRESS.md参照)。
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 import matplotlib
@@ -41,30 +46,52 @@ import pandas as pd
 from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
 
 
-def load_segment_measurement_history(database_path, direction, bin_start_m) -> pd.DataFrame:
-    """区間(direction, bin_start_m)の全実測値を`vector_database.sqlite`から読み込む。
+def load_segment_measurement_history(trend_catalog: pd.DataFrame, direction, bin_start_m, *,
+                                      velocity_manifest: pd.DataFrame | None = None) -> pd.DataFrame:
+    """区間(direction, bin_start_m)の全実測値を`trend_catalog`から読み込む。
+
+    2026-10-08: データソースを`vector_database.sqlite`の`trends`テーブルから`trend_catalog`に
+    変更した。`trends`テーブルは`model_split`が`model_train`/`model_validation`のレコードしか
+    含まない(リーク防止のため、検索guide用の埋め込みDBに推論対象自身のデータを入れていない)。
+    そのため、描画対象レコードの入力期間・出力期間自体がinference splitに属する場合、
+    まさにその期間だけ全実測値が丸ごと空白になる不具合があった(実データ`U方向2600-2700m`区間で
+    確認: `trends`テーブルは2024-04-15までしか無く、入力(2024-06〜)・出力(2025-02〜)期間が
+    完全に欠落していた)。`trend_catalog`はtrain/validation/inference全splitの測定値を含むため、
+    この欠落が起きない。
+
+    2026-10-08追記: 走行速度(velocity)も同様の理由で`vector_database.sqlite`の
+    `waveform_records`テーブル(`trends`と同じくmodel_train/model_validationのみ)から
+    結合していたが、ユーザー指摘により`artifact_dir/split_manifest.csv`(`import-snapshot`で
+    生成される、train/validation/inference全split・全420,686行分の`mean_velocity_kmh`を含む
+    元manifest)に変更した。速度自体はモデル分割と無関係にCSVから読み取れる値のため、本来
+    欠損する理由が無い。
+
+    velocity_manifest: 指定時は`split_manifest.csv`を読み込んだDataFrame
+    (`trend_id`・`direction`・`bin_start_m`・`mean_velocity_kmh`列を持つこと)を渡す。
+    省略時は速度列はすべてNaN(速度欠損として描画)になる。
 
     Returns:
         列`measurement_date`(datetime64)・`current_acc_z_max`(float)・`velocity`
-        (float、走行速度[km/h]の平均。該当する`waveform_records`が無い場合はNaN)を持つ
-        DataFrame。
+        (float、走行速度[km/h]の平均。該当するレコードが無い場合はNaN)を持つDataFrame。
     """
-    connection = sqlite3.connect(f"file:{Path(database_path).resolve().as_posix()}?mode=ro", uri=True)
-    try:
-        trends = pd.read_sql_query(
-            "SELECT trend_id, measurement_date, current_acc_z_max FROM trends "
-            "WHERE direction = ? AND bin_start_m = ?",
-            connection, params=(direction, float(bin_start_m)),
+    segment = trend_catalog.loc[
+        (trend_catalog["direction"] == direction)
+        & (trend_catalog["bin_start_m"].astype(float) == float(bin_start_m))
+    ][["trend_id", "measurement_date", "current_acc_z_max"]].copy()
+    segment["measurement_date"] = pd.to_datetime(segment["measurement_date"], errors="coerce")
+
+    velocity = pd.DataFrame(columns=["trend_id", "velocity"])
+    if velocity_manifest is not None:
+        subset = velocity_manifest.loc[
+            (velocity_manifest["direction"] == direction)
+            & (velocity_manifest["bin_start_m"].astype(float) == float(bin_start_m))
+        ]
+        velocity = (
+            subset.groupby("trend_id", as_index=False)["mean_velocity_kmh"]
+            .mean()
+            .rename(columns={"mean_velocity_kmh": "velocity"})
         )
-        velocity = pd.read_sql_query(
-            "SELECT trend_id, AVG(mean_velocity_kmh) AS velocity FROM waveform_records "
-            "WHERE direction = ? AND bin_start_m = ? GROUP BY trend_id",
-            connection, params=(direction, float(bin_start_m)),
-        )
-    finally:
-        connection.close()
-    trends["measurement_date"] = pd.to_datetime(trends["measurement_date"], errors="coerce")
-    return trends.merge(velocity, on="trend_id", how="left")
+    return segment.merge(velocity, on="trend_id", how="left")
 
 
 def render_measurement_history(ax, measurement_history: pd.DataFrame, *, vmin=0.0, vmax=100.0):
@@ -327,14 +354,48 @@ def _available_trend_ids(prediction_dir):
         return set(samples_npz["trend_ids"].astype(str))
 
 
+def compute_target_ranges(split_dir, metadata: pd.DataFrame) -> dict:
+    """正解値(target_values)12か月分の「幅」(有効な月のみでの最大値-最小値)を、
+    trend_id文字列をキーにしたdictで返す(有効な月が1つも無いレコードはキーに含めない)。
+
+    plot_prediction/plot_prediction_batchの`min_target_range`フィルタ(2026-10-08追加、
+    「予測期間中に加速度が大きく変化するレコードだけ見たい」というユーザー要望)の下請け。
+    """
+    split_dir = Path(split_dir)
+    target_values = np.load(split_dir / "target_values.npy")
+    target_masks = np.load(split_dir / "target_masks.npy")
+    ranges = {}
+    for index, trend_id in enumerate(metadata["trend_id"]):
+        valid = np.asarray(target_masks[index]) > 0
+        if not valid.any():
+            continue
+        values = np.asarray(target_values[index])[valid]
+        ranges[str(trend_id)] = float(values.max() - values.min())
+    return ranges
+
+
+def _load_velocity_manifest(artifact_dir):
+    """`artifact_dir/split_manifest.csv`(train/validation/inference全split分の
+    `mean_velocity_kmh`を含む元manifest、`import-snapshot`で生成される)を読み込む。
+    無ければNoneを返す(全実測値散布図は速度欠損として描画される)。
+    """
+    manifest_path = Path(artifact_dir) / "split_manifest.csv"
+    if not manifest_path.is_file():
+        return None
+    return pd.read_csv(manifest_path, encoding="utf-8-sig",
+                       usecols=["trend_id", "direction", "bin_start_m", "mean_velocity_kmh"])
+
+
 def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path, *,
-                    bin_width=0.1, dpi=150, database_path=None):
+                    bin_width=0.1, dpi=150, velocity_manifest=None):
     """1レコード分のnpy読み込み〜PNG書き出しまでを行う、`plot_prediction`/
     `plot_prediction_batch`共通の下請け関数。レコードの基本情報(dict)を返す。
 
-    database_path: 指定時は`vector_database.sqlite`から区間の全実測値を読み込んで
-    背景に重ねる(省略時はこれまで通り描画しない)。読み込みに失敗しても(DBが無い等)
-    プロット自体は失敗させない(全実測値は無しとして続行し、理由を標準エラーに出す)。
+    区間の全実測値(`load_segment_measurement_history`)は`trend_catalog`(train/validation/
+    inference全split)から常に読み込む。velocity_manifest指定時はさらに`split_manifest.csv`
+    から走行速度を結合する(省略時は速度欠損として描画)。読み込みに失敗しても(trend_catalogに
+    該当区間が無い等)プロット自体は失敗させない(全実測値は無しとして続行し、理由を標準エラーに
+    出す)。
     """
     split_dir = Path(split_dir)
     lookup = {str(value): index for index, value in enumerate(metadata["trend_id"])}
@@ -365,13 +426,14 @@ def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output
     maintenance_events = events_by_segment.get((direction, bin_start_m, bin_end_m), [])
 
     measurement_history = None
-    if database_path is not None:
-        try:
-            measurement_history = load_segment_measurement_history(database_path, direction, bin_start_m)
-        except Exception as error:  # DBが無い・壊れている等でも全実測値抜きで続行する
-            import sys
-            print(f"警告: 全実測値の読み込みに失敗しました({error!r})。この要素なしで描画します。",
-                 file=sys.stderr)
+    try:
+        measurement_history = load_segment_measurement_history(
+            trend_catalog, direction, bin_start_m, velocity_manifest=velocity_manifest,
+        )
+    except Exception as error:  # split_manifestが無い・壊れている等でも全実測値抜きで続行する
+        import sys
+        print(f"警告: 全実測値の読み込みに失敗しました({error!r})。この要素なしで描画します。",
+             file=sys.stderr)
 
     plot_prediction_record(
         output_path, trend_id=trend_id, dataset_id=row["dataset_id"], direction=direction,
@@ -392,8 +454,13 @@ def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output
 
 def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, split="inference",
                      trend_id=None, maintenance_relation="any", immediately_after_months=2.0,
-                     elapsed_months=6.0, seed=42, bin_width=0.1, dpi=150) -> dict:
-    """CLIから呼ばれるオーケストレーション関数。1レコードを選んでPNGを1枚書き出す。"""
+                     elapsed_months=6.0, seed=42, bin_width=0.1, dpi=150, min_target_range=None) -> dict:
+    """CLIから呼ばれるオーケストレーション関数。1レコードを選んでPNGを1枚書き出す。
+
+    min_target_range: 指定時は、予測期間(target_values12か月分、有効な月のみ)の
+    最大値-最小値がこの値以上のレコードだけを自動選択の対象にする(trend_id明示指定時は
+    select_record自体が選別を迂回するため、この絞り込みも適用されない)。
+    """
     dataset_dir, prediction_dir, artifact_dir, output_dir = (
         Path(dataset_dir), Path(prediction_dir), Path(artifact_dir), Path(output_dir)
     )
@@ -401,10 +468,16 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
     metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
     trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
 
+    available_trend_ids = _available_trend_ids(prediction_dir)
+    if min_target_range is not None:
+        ranges = compute_target_ranges(split_dir, metadata)
+        qualifying = {tid for tid, value in ranges.items() if value >= min_target_range}
+        available_trend_ids = available_trend_ids & qualifying
+
     selection = select_record(
         metadata, trend_catalog, trend_id=trend_id, maintenance_relation=maintenance_relation,
         immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
-        available_trend_ids=_available_trend_ids(prediction_dir), seed=seed,
+        available_trend_ids=available_trend_ids, seed=seed,
     )
     chosen_trend_id = selection["trend_id"]
     samples = _load_samples_for_trend_id(prediction_dir, chosen_trend_id)
@@ -415,10 +488,9 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
     filename = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor.date()}_{chosen_trend_id}.png"
     output_path = output_dir / filename
 
-    database_path = artifact_dir / "vector_database.sqlite"
     info = _render_record(metadata, trend_catalog, split_dir, samples, chosen_trend_id, output_path,
                           bin_width=bin_width, dpi=dpi,
-                          database_path=database_path if database_path.is_file() else None)
+                          velocity_manifest=_load_velocity_manifest(artifact_dir))
 
     maintenance_relation_for_summary = selection["maintenance_relation"] or classify_maintenance_relation(
         info["months_since_maintenance"], immediately_after_months=immediately_after_months,
@@ -431,11 +503,18 @@ def plot_prediction(dataset_dir, prediction_dir, artifact_dir, output_dir, *, sp
 
 
 def select_records(metadata: pd.DataFrame, trend_catalog: pd.DataFrame, *, count_per_category=3,
-                    immediately_after_months=2.0, elapsed_months=6.0, available_trend_ids=None,
-                    seed=42) -> dict:
+                    maintenance_relation="any", immediately_after_months=2.0, elapsed_months=6.0,
+                    available_trend_ids=None, seed=42) -> dict:
     """「immediately_after」「elapsed」の各カテゴリから、重複なくcount_per_category件まで
     ランダムに選ぶ(`select_record`の複数選択版)。カテゴリのプールがcount_per_category未満
     の場合は、そのカテゴリの全件を使う(エラーにはしない、実際に選んだ件数を結果に含める)。
+
+    maintenance_relation: "any"(既定)/"immediately_after"/"elapsed"。"any"以外を指定すると、
+    指定カテゴリ以外は最初からプールに入れない(2026-10-08追加・PROGRESS.md参照)。
+    「施工直後(immediately_after)」のanchorは、6か月の入力(history)のうち施工より前の
+    月がそのdataset_id(施工間隔)に存在しないため構造的に半分(3/6か月)しか有効でない
+    (`datasets/anchors.py`参照)。入力の完全性が重要な分析では"elapsed"を指定し、
+    このカテゴリを除外する運用とする。
 
     Returns:
         {"immediately_after": [trend_id, ...], "elapsed": [trend_id, ...],
@@ -450,6 +529,8 @@ def select_records(metadata: pd.DataFrame, trend_catalog: pd.DataFrame, *, count
             months, immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
         )
         if category is None:
+            continue
+        if maintenance_relation != "any" and category != maintenance_relation:
             continue
         trend_id = str(row["trend_id"])
         if available_trend_ids is not None and trend_id not in available_trend_ids:
@@ -466,50 +547,98 @@ def select_records(metadata: pd.DataFrame, trend_catalog: pd.DataFrame, *, count
 
 
 def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, *, split="inference",
-                          count_per_category=3, immediately_after_months=2.0, elapsed_months=6.0,
-                          seed=42, bin_width=0.1, dpi=150) -> dict:
+                          count_per_category=3, maintenance_relation="any", immediately_after_months=2.0,
+                          elapsed_months=6.0, seed=42, bin_width=0.1, dpi=150, min_target_range=None) -> dict:
     """複数レコード×複数手法(手法名→prediction_dirの対応表)を一括生成する。
 
-    出力は`output_dir/<trend_id>/<手法名>.png`(レコードごとにフォルダ、同一レコードの
-    手法間比較がしやすい構成、2026-10-07にユーザーと決定)。レコードは区間の施工記録から
-    「直後」「経過」それぞれcount_per_category件ずつランダム選択し、全手法の
-    prediction_dirに共通して存在するtrend_idだけを対象にする(どれか1つでも欠けている
-    レコードは選ばない)。
+    出力は`output_dir/<区間_起点日>/<手法名>.png`(レコードごとにフォルダ、同一レコードの
+    手法間比較がしやすい構成)。フォルダ名は`{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_
+    {anchor_date}`(区間の位置+予測起点日、2026-10-07にユーザーと決定・trend_idは含めない)。
+    同一区間・同一起点日で別dataset_id(=別の施工間隔)のレコードが存在した場合はフォルダ名が
+    衝突するため、その場合は例外を出す(現行データでの実際の衝突は未確認)。各フォルダが
+    どのtrend_id/dataset_idに対応するかは`output_dir/manifest.csv`に記録する(2026-10-07
+    決定)。
+
+    レコードは区間の施工記録から「直後」「経過」それぞれcount_per_category件ずつランダム
+    選択し、全手法のprediction_dirに共通して存在するtrend_idだけを対象にする(どれか1つでも
+    欠けているレコードは選ばない)。
+
+    maintenance_relation: "any"(既定)/"immediately_after"/"elapsed"。"elapsed"を指定すると
+    「施工直後」カテゴリを選択対象から外す(2026-10-08追加・PROGRESS.md参照。「施工直後」
+    anchorは入力(history)が構造的に半分(3/6か月)しか有効でないため、入力の完全性が
+    重要な分析ではこちらを使う)。
+
+    min_target_range: 指定時は、予測期間(target_values12か月分、有効な月のみ)の
+    最大値-最小値がこの値以上のレコードだけを選択対象プールに残す(2026-10-08追加、
+    「予測期間中に加速度が大きく変化するレコードだけ見たい」というユーザー要望)。
     """
     dataset_dir, artifact_dir, output_dir = Path(dataset_dir), Path(artifact_dir), Path(output_dir)
     split_dir = dataset_dir / split
     metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
     trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+    metadata_lookup = {str(value): index for index, value in enumerate(metadata["trend_id"])}
 
     available_per_method = {name: _available_trend_ids(path) for name, path in methods.items()}
     common_available = set.intersection(*available_per_method.values()) if available_per_method else set()
+    if min_target_range is not None:
+        ranges = compute_target_ranges(split_dir, metadata)
+        qualifying = {tid for tid, value in ranges.items() if value >= min_target_range}
+        common_available = common_available & qualifying
 
     selection = select_records(
         metadata, trend_catalog, count_per_category=count_per_category,
-        immediately_after_months=immediately_after_months, elapsed_months=elapsed_months,
-        available_trend_ids=common_available, seed=seed,
+        maintenance_relation=maintenance_relation, immediately_after_months=immediately_after_months,
+        elapsed_months=elapsed_months, available_trend_ids=common_available, seed=seed,
     )
     selected_trend_ids = [
         (trend_id, category) for category in ("immediately_after", "elapsed") for trend_id in selection[category]
     ]
 
-    database_path = artifact_dir / "vector_database.sqlite"
-    database_path = database_path if database_path.is_file() else None
+    velocity_manifest = _load_velocity_manifest(artifact_dir)
 
     records = []
+    manifest_rows = []
+    folder_names_seen = {}
     for trend_id, category in selected_trend_ids:
-        record_dir = output_dir / trend_id
+        row = metadata.iloc[metadata_lookup[trend_id]]
+        direction = row["direction"]
+        bin_start_m, bin_end_m = float(row["bin_start_m"]), float(row["bin_end_m"])
+        anchor_date = pd.Timestamp(row["anchor_date"]).date()
+        folder_name = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor_date}"
+        if folder_name in folder_names_seen:
+            raise ValueError(
+                f"フォルダ名{folder_name!r}がtrend_id={trend_id!r}と"
+                f"trend_id={folder_names_seen[folder_name]!r}の間で衝突しました"
+                "(同一区間・同一起点日で別dataset_idのレコードが存在します)。"
+            )
+        folder_names_seen[folder_name] = trend_id
+
+        record_dir = output_dir / folder_name
         outputs = {}
         for method_name, prediction_dir in methods.items():
             samples = _load_samples_for_trend_id(prediction_dir, trend_id)
             output_path = record_dir / f"{method_name}.png"
             info = _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output_path,
-                                  bin_width=bin_width, dpi=dpi, database_path=database_path)
+                                  bin_width=bin_width, dpi=dpi, velocity_manifest=velocity_manifest)
             outputs[method_name] = str(output_path)
-        records.append({"trend_id": trend_id, "maintenance_relation": category,
+        records.append({"trend_id": trend_id, "folder": folder_name, "maintenance_relation": category,
                         "months_since_maintenance": info["months_since_maintenance"], "outputs": outputs})
+        manifest_rows.append({
+            "folder": folder_name, "trend_id": trend_id, "dataset_id": str(row["dataset_id"]),
+            "direction": direction, "bin_start_m": bin_start_m, "bin_end_m": bin_end_m,
+            "anchor_date": str(anchor_date), "maintenance_relation": category,
+            "months_since_maintenance": info["months_since_maintenance"],
+            **{f"output_{name}": path for name, path in outputs.items()},
+        })
+
+    manifest_path = None
+    if manifest_rows:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = output_dir / "manifest.csv"
+        pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False, encoding="utf-8-sig")
 
     return {
         "split": split, "methods": list(methods), "record_count": len(records),
         "pool_sizes": selection["pool_sizes"], "records": records,
+        "manifest_path": str(manifest_path) if manifest_path is not None else None,
     }

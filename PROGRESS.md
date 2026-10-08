@@ -1248,6 +1248,103 @@ checkpointも同じ呼び出しで正しく読み込めるようになった)。
 
 ---
 
+## [2026-10-08] plot-predictionの改善2件 + 「施工直後」anchorの入力欠損に関する設計確認
+
+### 1. 全実測値散布図が入力・出力期間だけ空白になる不具合を修正
+
+`plot-prediction`の背景レイヤー「区間の全実測値(走行速度で色分け)」
+(`evaluation/visualize.py::load_segment_measurement_history`)が、`vector_database.sqlite`の
+`trends`テーブル(`model_split`が`model_train`/`model_validation`のみを含む、リーク防止のため
+推論対象自身のデータを入れていない)から読み込んでいたため、描画対象レコード自身の入力・
+出力期間(inference split)がまるごと空白になっていた(実データ`U方向2600-2700m`区間で確認:
+`trends`テーブルは2024-04-15までしかデータが無く、入力(2024-06〜)・出力(2025-02〜)期間が
+完全に欠落)。
+
+データソースを、train/validation/inference全splitを含む`trend_catalog`に変更(走行速度のみ
+引き続き`vector_database.sqlite`から結合、無ければ速度欠損としてグレー表示)。テスト4件追加・
+変更、`tests/`全体287件pass。
+
+### 2. 予測期間の変化量でレコードを絞り込む`min_target_range`を追加
+
+「予測期間(12か月)中に加速度が大きく変化するレコードだけ見たい」という要望を受け、
+`plot_prediction`/`plot_prediction_batch`に`min_target_range`引数(target_values12か月分、
+有効な月のみでの最大値-最小値がこの値以上のレコードだけを選択対象にする)を追加。CLIにも
+`--min-target-range`を追加。テスト6件追加、`tests/`全体287件pass。
+
+### 3. 「施工直後(immediately_after)」anchorは入力(history)が構造的に半分しか無い
+
+`min_target_range=1.5`で試したところ、「施工直後/経過」カテゴリ内に該当レコードが0件
+だった(該当31件は全て「施工から2〜6か月」の未分類期間に集中)。調査の過程で、
+「施工直後」anchorの入力構造そのものに設計上の注意点があることが分かった。
+
+**原因**: `datasets/anchors.py::select_anchors_for_segment`は、**単一dataset_id
+(施工間隔、`retrieval/trends.py`の「施工間セグメント」)の行だけ**から6か月分の履歴
+(`history_values`/`history_mask`)を組み立てている。dataset_idは直近の施工で区切られた
+区間なので、施工より前の月はそのdataset_idのデータに**そもそも存在せず**、
+`history_mask`で自動的に欠損(0)扱いになる(施工日より前を狙って除外する特別なロジックが
+あるわけではなく、dataset_idの区切り方自体がそれを保証している)。
+
+加えて`common/constants.py::MIN_HISTORY_MONTHS=3`により、6か月中3か月以上有効であれば
+anchorとして採用されるため、「施工直後」のレコードは入力が半分欠損のまま採用され得る。
+
+**実データでの検証**(`artifacts/dataset/inference`、1,119件):
+
+| カテゴリ | 件数 | 有効な入力月数の内訳 |
+|---|---|---|
+| immediately_after(施工から2か月以内) | 11 | **全11件が3/6か月のみ有効**(残り3か月は欠損) |
+| elapsed(施工から6か月以上) | 181 | 6/6:142件(78.5%)・5/6:31件(17.1%)・3/6:8件(4.4%) |
+
+「施工直後」は**例外なく**入力の半分(3/6か月)が欠損した状態で採用されている。一方
+「経過」は大半(78.5%)が完全な6/6か月だが、一部(21.5%)は5/6または3/6に留まる。
+
+**決定(ユーザー指示、2026-10-08)**: 入力の完全性が重要な分析(今回の`min_target_range`
+によるレコード選別など)では、**「施工直後(immediately_after)」カテゴリを使わず、
+「経過(elapsed、施工から6か月以上)」カテゴリのみを対象にする**。「施工直後」は入力
+(history)の半分が構造的に欠損しているため、6か月の入力ウィンドウを前提とする分析には
+使うべきではない、という判断。
+
+**追加決定(ユーザー指示、2026-10-08)**: 「経過」カテゴリ内の5/6・3/6の不完全な入力
+(計21.5%、39/181件)は除外しない。既存の`MIN_HISTORY_MONTHS=3`(3/6以上で採用)基準を
+そのまま使う——「施工直後を使わない」のが主な対応で、「経過」内のさらなる厳密化は行わない。
+
+**実装**: `select_records`/`plot_prediction_batch`に`maintenance_relation`引数
+(`select_record`/`plot_prediction`に既にあるものと同じ、既定"any")を追加し、
+"elapsed"を指定すれば施工直後カテゴリを最初からプールに入れないようにした。CLIにも
+`plot-prediction-batch --maintenance-relation`を追加。
+
+### 4. 全実測値の走行速度も同じ理由(split制限)で欠損していた不具合を修正
+
+上記1.と同じ原因で、「全実測値」散布図の走行速度による色分けも大半がグレー(速度欠損)に
+なっていた。`load_segment_measurement_history`の速度結合先が`vector_database.sqlite`の
+`waveform_records`テーブル(`trends`と同じくmodel_train/model_validationのみ)だったため。
+
+ユーザー指摘(「速度の欠損は基本ないはず。csvから読み込めるはずです」)を受けて確認した
+ところ、`artifact_dir/split_manifest.csv`(`import-snapshot`で生成される元manifest)に
+train/validation/inference全split・全行分の`mean_velocity_kmh`が存在することを確認
+(実データ420,686行、trend_catalogとtrend_id完全一致)。データソースをこちらに変更し、
+`vector_database.sqlite`への依存(`database_path`引数・`sqlite3` import)をこの機能から
+完全に除去した。
+
+実データ(`U方向2600-2700m`起点2024-11-29)で再生成し、グレー点が0件になった(全点に
+色が付いた)ことを目視確認済み。テスト3件更新、`tests/`全体でpass確認中。
+
+### 5. min_target_range=1.5は実データでは「経過」カテゴリ内でも0件(最大1.44)
+
+`min_target_range`で10セット生成を試みた際、`maintenance_relation=elapsed`と
+組み合わせても実データでは幅≥1.5のレコードが0件だった(経過カテゴリ内の実際の最大は
+D方向1.439250)。ユーザーと協議の上、閾値を1.2に下げて運用(D方向9件が該当・全件使用)。
+U方向は閾値1.2では0件(U方向の経過カテゴリ内最大は1.185472)だったため、該当する唯一の
+事象(U 4500-4600m、スライディングウィンドウで2起点日から見える同一事象)を手動で
+`artifacts/plots_batch_range1_5/manifest.csv`に追記した。
+
+幅が大きくなるケースの傾向(実データ分析): 12か月の予測期間が徐々に変化するのではなく、
+**1か月だけ突出した外れ値(急激な低下/急上昇)**を含むケースがほとんどだった。
+スライディングウィンドウにより同一の実事象が複数の起点日から異なる相対月位置で
+捉えられるため、「候補レコード数」と「独立した実事象数」は大きく異なる(実データで
+17候補→独立事象6件程度)。
+
+---
+
 ## [2026-10-08] 検索方法の変更(6か月履歴ベースのguide検索)を検証 — モデル・正規化は不変
 
 ### 背景・目的

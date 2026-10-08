@@ -132,6 +132,18 @@ def test_cli_plot_prediction_runs_against_a_fabricated_fixture(tmp_path, capsys)
     assert Path(result["output_path"]).is_file()
 
 
+def test_cli_plot_prediction_accepts_min_target_range(tmp_path, capsys):
+    from test_visualize import _write_visualize_fixture
+
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+
+    code, result = _run(capsys, "plot-prediction", "--dataset-dir", dataset_dir, "--split", "inference",
+                        "--prediction-dir", prediction_dir, "--artifact-dir", artifact_dir,
+                        "--output-dir", tmp_path / "out_filtered", "--min-target-range", 0.0, "--seed", 0)
+    assert code == 0
+    assert Path(result["output_path"]).is_file()
+
+
 def test_cli_plot_prediction_batch_runs_against_fabricated_fixtures(tmp_path, capsys):
     from test_visualize import _write_extra_prediction_dir, _write_visualize_fixture
 

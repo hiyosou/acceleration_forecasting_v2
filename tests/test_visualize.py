@@ -1,7 +1,6 @@
 """evaluation.visualize の単体テスト(予測結果の可視化、plot-prediction)。"""
 
 import json
-import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from acceleration_forecasting_v2.datasets.build import write_dataset
 from acceleration_forecasting_v2.evaluation.visualize import (
     classify_maintenance_relation,
     compute_fixed_bins,
+    compute_target_ranges,
     load_segment_measurement_history,
     months_since_maintenance,
     plot_prediction,
@@ -234,6 +234,17 @@ def test_select_records_is_deterministic_for_a_fixed_seed():
     assert first == second
 
 
+def test_select_records_maintenance_relation_elapsed_excludes_immediately_after_pool():
+    # 2026-10-08決定: 「施工直後」anchorは入力(history)が構造的に半分欠損しているため、
+    # 入力の完全性が重要な分析ではmaintenance_relation="elapsed"で除外できるようにした。
+    metadata, catalog = _segment_metadata_and_catalog_many()
+    result = select_records(metadata, catalog, count_per_category=10,
+                            maintenance_relation="elapsed", seed=0)
+    assert result["immediately_after"] == []
+    assert set(result["elapsed"]) == {"e1", "e2", "e3"}
+    assert result["pool_sizes"] == {"immediately_after": 0, "elapsed": 3}
+
+
 # --- compute_fixed_bins -----------------------------------------------------------------------
 
 def test_compute_fixed_bins_covers_the_range_with_bin_width_increments():
@@ -286,48 +297,46 @@ def test_render_quartile_band_matches_numpy_percentile():
 
 # --- load_segment_measurement_history / render_measurement_history -----------------------------
 
-def _write_tiny_vector_database(path, rows):
-    """rowsは(trend_id, measurement_date, current_acc_z_max, direction, bin_start_m,
-    bin_end_m, velocity_or_None)のタプル列。velocityがNoneの行はwaveform_recordsに
-    何も入れない(=速度欠損として扱われるべきレコード)。
+def _velocity_manifest_frame(rows):
+    """rowsは(trend_id, direction, bin_start_m, mean_velocity_kmh)のタプル列
+    (`split_manifest.csv`を模したDataFrameを作る。train/validation/inference全splitの
+    行を同列に含み得る点がvector_database.sqliteの`waveform_records`テーブルとの違い)。
     """
-    from acceleration_forecasting_v2.retrieval.database import SCHEMA
-
-    connection = sqlite3.connect(str(path))
-    connection.executescript(SCHEMA)
-    seen_trend_ids = set()
-    for index, (trend_id, date, acc, direction, bin_start_m, bin_end_m, velocity) in enumerate(rows):
-        if trend_id not in seen_trend_ids:
-            seen_trend_ids.add(trend_id)
-            connection.execute(
-                "INSERT INTO trends (trend_id, dataset_id, model_split, measurement_date, direction, "
-                "bin_start_m, bin_end_m, current_acc_z_max, future_values, future_mask, selected_dates, "
-                "guide_available_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (trend_id, "d0", "model_train", date, direction, bin_start_m, bin_end_m, acc,
-                 "[]", "[]", "[]", "2099-01-01"),
-            )
-        if velocity is not None:
-            connection.execute(
-                "INSERT INTO waveform_records (record_id, measurement_id, measurement_date, direction, "
-                "bin_start_m, bin_end_m, mean_velocity_kmh, source_csv_path, waveform_sha256, dataset_id, "
-                "trend_id, embedding, embedding_dim) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (f"r{index}", f"m{index}", date, direction, bin_start_m, bin_end_m, velocity,
-                 "x.csv", "sha", "d0", trend_id, b"\x00\x00\x00\x00", 1),
-            )
-    connection.commit()
-    connection.close()
+    return pd.DataFrame(rows, columns=["trend_id", "direction", "bin_start_m", "mean_velocity_kmh"])
 
 
-def test_load_segment_measurement_history_averages_velocity_and_filters_by_segment(tmp_path):
-    db_path = tmp_path / "vector_database.sqlite"
-    _write_tiny_vector_database(db_path, [
-        ("t0", "2023-01-01", 1.0, "D", 0.0, 100.0, 60.0),
-        ("t0", "2023-01-01", 1.0, "D", 0.0, 100.0, 80.0),  # t0と同じ日に2本→平均70.0
-        ("t1", "2023-02-01", 1.5, "D", 0.0, 100.0, None),  # 速度欠損
-        ("t2", "2023-03-01", 2.0, "U", 0.0, 100.0, 50.0),  # 別区間(direction違い)、対象外
+def test_load_segment_measurement_history_reads_from_trend_catalog_and_filters_by_segment():
+    # trend_catalogはtrain/validation/inference全splitを含む想定(vector_database.sqliteの
+    # trendsテーブルと異なり、split制限が無いことを確認するテスト)。
+    catalog = _trend_catalog_frame([
+        {"trend_id": "t0", "measurement_date": "2023-01-01", "current_acc_z_max": 1.0,
+         "direction": "D", "bin_start_m": 0.0},
+        {"trend_id": "t1", "measurement_date": "2023-02-01", "current_acc_z_max": 1.5,
+         "direction": "D", "bin_start_m": 0.0},
+        {"trend_id": "t2", "measurement_date": "2023-03-01", "current_acc_z_max": 2.0,
+         "direction": "U", "bin_start_m": 0.0},  # 別区間(direction違い)、対象外
     ])
-    history = load_segment_measurement_history(db_path, "D", 0.0)
+    history = load_segment_measurement_history(catalog, "D", 0.0)
     assert set(history["trend_id"]) == {"t0", "t1"}
+    assert history["velocity"].isna().all()  # velocity_manifest省略時は速度列すべてNaN
+
+
+def test_load_segment_measurement_history_joins_velocity_from_manifest_when_given():
+    # t1はtrend_catalogには存在するがvelocity_manifestには無い状態を再現し、
+    # 速度欠損として扱われることを確認する(split_manifest.csvは全split分の速度を含む想定
+    # だが、念のため欠けていても落ちないことを確認)。
+    catalog = _trend_catalog_frame([
+        {"trend_id": "t0", "measurement_date": "2023-01-01", "current_acc_z_max": 1.0,
+         "direction": "D", "bin_start_m": 0.0},
+        {"trend_id": "t1", "measurement_date": "2023-02-01", "current_acc_z_max": 1.5,
+         "direction": "D", "bin_start_m": 0.0},
+    ])
+    manifest = _velocity_manifest_frame([
+        ("t0", "D", 0.0, 60.0),
+        ("t0", "D", 0.0, 80.0),  # t0と同じ日に2本→平均70.0
+        ("t2", "U", 0.0, 50.0),  # 別区間(direction違い)、対象外
+    ])
+    history = load_segment_measurement_history(catalog, "D", 0.0, velocity_manifest=manifest)
     row_t0 = history.loc[history["trend_id"] == "t0"].iloc[0]
     assert row_t0["velocity"] == pytest.approx(70.0)
     row_t1 = history.loc[history["trend_id"] == "t1"].iloc[0]
@@ -346,13 +355,26 @@ def test_render_measurement_history_draws_colored_and_gray_scatter_separately():
     plt.close(fig)
 
 
-def test_plot_prediction_includes_measurement_history_when_database_path_is_given(tmp_path):
+def test_plot_prediction_includes_measurement_history_when_velocity_manifest_is_given(tmp_path):
     dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
     row = metadata.iloc[0]
-    _write_tiny_vector_database(artifact_dir / "vector_database.sqlite", [
-        (str(row["trend_id"]), str(row["anchor_date"]), 1.0, "D", 0.0, 100.0, 60.0),
-    ])
+    _velocity_manifest_frame([
+        (str(row["trend_id"]), "D", 0.0, 60.0),
+    ]).to_csv(artifact_dir / "split_manifest.csv", index=False, encoding="utf-8-sig")
     result = plot_prediction(dataset_dir, prediction_dir, artifact_dir, tmp_path / "out_hist",
+                             split="inference", trend_id=str(row["trend_id"]))
+    output_path = Path(result["output_path"])
+    assert output_path.is_file() and output_path.stat().st_size > 0
+
+
+def test_plot_prediction_includes_measurement_history_even_without_split_manifest(tmp_path):
+    # split_manifest.csv自体が無い(=全実測値の元がtrend_catalogのみ)場合でも、
+    # 全実測値の背景散布図(速度は欠損扱い)込みで描画できることを確認する
+    # (inference splitの期間が丸ごと空白になっていたバグの再発防止)。
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+    row = metadata.iloc[0]
+    assert not (artifact_dir / "split_manifest.csv").exists()
+    result = plot_prediction(dataset_dir, prediction_dir, artifact_dir, tmp_path / "out_no_manifest",
                              split="inference", trend_id=str(row["trend_id"]))
     output_path = Path(result["output_path"])
     assert output_path.is_file() and output_path.stat().st_size > 0
@@ -388,6 +410,8 @@ def _write_visualize_fixture(tmp_path, *, n_inference=3):
         rows.append({
             "trend_id": trend_id, "dataset_id": "D_0-100_001", "direction": "D",
             "bin_start_m": 0.0, "bin_end_m": 100.0,
+            "measurement_date": anchor.strftime("%Y-%m-%d"),
+            "current_acc_z_max": float(metadata["current_acc_z_max"].iloc[index]),
             "selected_dates": json.dumps([date.strftime("%Y-%m-%d") for date in forecast_dates]),
             "cutoff_maintenance_date": "2023-01-01", "maintenance_type": "real",
             "maintenance_description": "軌道整備",
@@ -453,9 +477,122 @@ def test_plot_prediction_batch_creates_one_folder_per_record_with_one_png_per_me
     assert result["record_count"] == 2
     assert set(result["methods"]) == {"method_a", "method_b"}
     for record in result["records"]:
-        record_dir = tmp_path / "batch_out" / record["trend_id"]
+        record_dir = tmp_path / "batch_out" / record["folder"]
         assert record_dir.is_dir()
+        # フォルダ名はtrend_idではなく区間+起点日(2026-10-07決定)
+        assert record["trend_id"] not in record["folder"]
         for method_name in ("method_a", "method_b"):
             output_path = Path(record["outputs"][method_name])
             assert output_path.parent == record_dir
             assert output_path.is_file() and output_path.stat().st_size > 0
+
+    manifest_path = Path(result["manifest_path"])
+    assert manifest_path == tmp_path / "batch_out" / "manifest.csv"
+    manifest = pd.read_csv(manifest_path, encoding="utf-8-sig")
+    assert set(manifest["folder"]) == {record["folder"] for record in result["records"]}
+    assert set(manifest["trend_id"].astype(str)) == {record["trend_id"] for record in result["records"]}
+    assert "output_method_a" in manifest.columns and "output_method_b" in manifest.columns
+
+
+def test_compute_target_ranges_uses_only_valid_months(tmp_path):
+    split_dir = tmp_path / "split"
+    split_dir.mkdir(parents=True, exist_ok=True)
+    # t0: 全月有効、幅=2.0-1.0=1.0。t1: 一部無効、無効部分(99.0)は幅計算から除外されるべき。
+    # t2: 全月無効→戻り値のdictにキー自体が存在しないべき。
+    target_values = np.array([
+        [1.0, 1.5, 2.0] + [1.0] * 9,
+        [1.0, 99.0, 3.0] + [1.0] * 9,
+        [5.0] * 12,
+    ], dtype=np.float32)
+    target_masks = np.array([
+        [1] * 12,
+        [1, 0, 1] + [1] * 9,
+        [0] * 12,
+    ], dtype=np.float32)
+    np.save(split_dir / "target_values.npy", target_values)
+    np.save(split_dir / "target_masks.npy", target_masks)
+    metadata = pd.DataFrame({"trend_id": ["t0", "t1", "t2"]})
+
+    ranges = compute_target_ranges(split_dir, metadata)
+    assert ranges["t0"] == pytest.approx(1.0)
+    assert ranges["t1"] == pytest.approx(2.0)  # 99.0を無視すれば3.0-1.0=2.0
+    assert "t2" not in ranges
+
+
+def test_plot_prediction_batch_min_target_range_excludes_records_below_threshold(tmp_path):
+    # fixtureのtarget_valuesは_raw_split(test_training._raw_split)由来で、
+    # 12か月分のslope(0.0〜0.5線形)により全レコードの幅が厳密に0.5になる設計。
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+
+    result = plot_prediction_batch(
+        dataset_dir, artifact_dir, tmp_path / "batch_out_excluded",
+        methods={"method_a": str(prediction_dir)}, split="inference", count_per_category=1, seed=0,
+        min_target_range=1.0,  # 全レコードの幅(0.5)を上回る閾値→何も選ばれない
+    )
+    assert result["record_count"] == 0
+    assert result["pool_sizes"] == {"immediately_after": 0, "elapsed": 0}
+
+
+def test_plot_prediction_batch_min_target_range_keeps_records_above_threshold(tmp_path):
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+
+    result = plot_prediction_batch(
+        dataset_dir, artifact_dir, tmp_path / "batch_out_kept",
+        methods={"method_a": str(prediction_dir)}, split="inference", count_per_category=1, seed=0,
+        min_target_range=0.4,  # 全レコードの幅(0.5)を下回る閾値→フィルタ無し時と同じ結果
+    )
+    assert result["record_count"] == 2
+
+
+def test_plot_prediction_batch_maintenance_relation_elapsed_excludes_immediately_after(tmp_path):
+    # fixtureのanchor_dates: 2023-01-11(immediately_after)・2023-07-20(elapsed)・
+    # 2023-03-22(どちらでもない)。maintenance_relation="elapsed"ならelapsedの1件のみ。
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+
+    result = plot_prediction_batch(
+        dataset_dir, artifact_dir, tmp_path / "batch_out_elapsed_only",
+        methods={"method_a": str(prediction_dir)}, split="inference", count_per_category=10,
+        maintenance_relation="elapsed", seed=0,
+    )
+    assert result["record_count"] == 1
+    assert result["records"][0]["maintenance_relation"] == "elapsed"
+    assert result["pool_sizes"] == {"immediately_after": 0, "elapsed": 1}
+
+
+def test_plot_prediction_batch_raises_on_folder_name_collision(tmp_path):
+    """同一区間・同一起点日で別dataset_id(=別の施工間隔)のレコードが2件存在すると、
+    フォルダ名(区間+起点日、trend_idを含まない)が衝突してValueErrorになる。
+    """
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path, n_inference=3)
+    inference_dir = dataset_dir / "inference"
+
+    # metadata.csvに、元の1件目(trend_id=t0、区間D/0-100m、起点2023-01-11)と
+    # 区間・起点日が完全に同じだが dataset_id/trend_id だけが違う行を追加する。
+    metadata_df = pd.read_csv(inference_dir / "metadata.csv", encoding="utf-8-sig")
+    duplicate_row = metadata_df.iloc[0].copy()
+    duplicate_row["trend_id"] = "t0_dup"
+    duplicate_row["dataset_id"] = "D_0-100_002"
+    metadata_df = pd.concat([metadata_df, pd.DataFrame([duplicate_row])], ignore_index=True)
+    metadata_df.to_csv(inference_dir / "metadata.csv", index=False, encoding="utf-8-sig")
+
+    for name in ("history_values", "history_masks", "guide_values", "guide_masks", "target_values", "target_masks"):
+        array = np.load(inference_dir / f"{name}.npy")
+        np.save(inference_dir / f"{name}.npy", np.concatenate([array, array[0:1]], axis=0))
+
+    trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+    duplicate_catalog_row = trend_catalog.iloc[0].copy()
+    duplicate_catalog_row["trend_id"] = "t0_dup"
+    duplicate_catalog_row["dataset_id"] = "D_0-100_002"
+    trend_catalog = pd.concat([trend_catalog, pd.DataFrame([duplicate_catalog_row])], ignore_index=True)
+    trend_catalog.to_csv(artifact_dir / "trend_catalog.csv", index=False, encoding="utf-8-sig")
+
+    with np.load(prediction_dir / "samples.npz") as samples_npz:
+        trend_ids = np.concatenate([samples_npz["trend_ids"], ["t0_dup"]]).astype("U")
+        samples = np.concatenate([samples_npz["samples"], samples_npz["samples"][0:1]], axis=0)
+    np.savez_compressed(prediction_dir / "samples.npz", trend_ids=trend_ids, samples=samples)
+
+    with pytest.raises(ValueError, match="衝突"):
+        plot_prediction_batch(
+            dataset_dir, artifact_dir, tmp_path / "batch_collide",
+            methods={"method_a": str(prediction_dir)}, split="inference", count_per_category=2, seed=0,
+        )
