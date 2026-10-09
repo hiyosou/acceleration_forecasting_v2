@@ -1613,3 +1613,135 @@ weight-norm比較では検出できない)。
    済む低コストな検証のため、P3の事後チェックとして組み込むことを推奨)。
 - 判定: 実装・実行・記録完了(コード変更・再学習なし)。次はP3(guide検索方法を
   変えたmodel_train/model_validationの再構築+再学習)に進む想定。
+
+## [2026-10-09] P3: guide検索方法を変えて学習データを作り直し再学習 + 反事実分解の再実行
+
+`GENERATIVE_MODULE_NEXT_STEPS.md`のP3(本命・中コスト)。2026-10-08の実験では
+**推論時だけ**guideを履歴ベース検索に差し替えても最終精度は変わらなかった
+(「モデルは学習時に見た品質の低いguideの分布でしか学習していない」という仮説)。
+P3ではmodel_train/model_validation/inferenceの**全split**のguideを履歴ベース検索
+(`search_by_history`)で作り直し、現行best(`self_target_loss_weight=1.0`等)と
+完全に同一の条件で再学習し、(a) 最終精度が改善するか、(b) P2の反事実分解
+(dec12のcontext_only起因の負感度)が変化するかを検証した。
+
+### 実装
+
+`datasets/history_search_dataset.py`に`build_history_search_dataset`
+(`splits_to_rebuild`で指定した全splitを`search_by_history`で作り直し、
+`datasets.build.write_split`/`fit_condition_and_target_normalization`を再利用して
+書き出す汎用版)を追加。既存の`build_history_search_inference_dataset`
+(inference限定)はこの薄いラッパーに書き換え、既存7テストは無変更でgreenのまま
+(新規4テスト追加、計12テスト)。
+
+実装中に1点、重要な罠を発見・回避した: 当初`datasets.build.write_dataset`を
+素通しで再利用する設計にしたが、未変更split(model_train等)のmetadata.csvを
+一度`pd.read_csv`→`to_csv`で往復させると、float列(`segment_weight`の`1/12`等)が
+`0.08333333333333333`→`0.0833333333333333`のように1桁丸められることが判明した
+(pandasのCSV往復はfloat64の桁落ちを起こしうる)。再構築しないsplitは
+`shutil.copytree`でbyte-identicalにコピーし、再構築したsplitのみ
+`write_split`/`fit_condition_and_target_normalization`を通す設計に修正した。
+
+### 実行(実データ)
+
+1. データセット再構築: `artifacts/dataset_history_search_v2`(全3 split、
+   model_train 36,657 + model_validation 3,301 + inference 1,119 = 41,077件)、
+   所要約3,242秒(約54分)。`verify` CLIでリーク検査violation 0件を確認。
+   `condition_normalization`: mean 1.5362→1.5164、std 0.5195→0.5501
+   (guide分布の変化を反映、target_normalizationは不変)。
+2. 再学習: `--prediction-type epsilon --self-target-loss-weight 1.0 --seed 42`
+   (現行bestと同一設定)。51epoch・約10,685秒(約2時間58分)で収束。
+   `model_config`は`dataset_build_id`以外、現行bestと完全一致を確認(条件を
+   1変数だけ変えるという前提の検証)。`best_validation_loss`は0.24308(現行best
+   は0.24235、ほぼ同水準)。
+3. 評価(`predict`→`evaluate`→`evaluate-guide-fidelity`→`compare`)。
+
+### 結果1: 最終精度は変わらない(CI95%が完全に重複)
+
+| 指標(record-level) | 現行best | P3再学習 |
+|---|---|---|
+| MAE | 0.21307 [0.19403, 0.23154] | 0.21268 [0.19340, 0.23167] |
+| correlation | 0.30012 [0.23481, 0.36596] | 0.29479 [0.23074, 0.35974] |
+| direction_sign_agreement | 0.53597 [0.52060, 0.55021] | 0.53759 [0.52208, 0.55173] |
+
+guide品質を学習時から底上げしても、最終DDIM生成精度は**有意差なし**
+(全指標でCI95%がほぼ完全に重複)。
+
+### 結果2: guide追従度(generated vs guide)も変わらない
+
+| | guide_vs_target_MAE | generated_vs_guide_MAE | 差(追従度のギャップ) |
+|---|---|---|---|
+| 旧model+旧guide(本番) | 0.3641 | 0.4137 | 0.0496 |
+| 旧model+新guide(2026-10-08、推論時だけ差替) | 0.2664 | 0.3182 | 0.0518 |
+| **新model(P3)+新guide** | 0.2664 | 0.3155 | **0.0491** |
+
+guide品質(guide_vs_target_MAE)は改善したまま(0.2664で前回と同一水準、同じ
+検索方法のため)だが、モデルの追従度のギャップは0.0491〜0.0518の範囲でほぼ不変。
+**学習時にguideを入れ替えても、モデルがguideに追従する度合い自体は変わらない。**
+
+### 結果3: 診断レベルの指標は大きく変化した(しかし最終精度には転写されない)
+
+| t | adv_vs_shuffled(現行best) | adv_vs_shuffled(P3) | self_target_improvement(P3) |
+|---|---|---|---|
+| 50 | 0.00004 | 0.00013 | 0.02650 |
+| 200 | 0.00059 | 0.00397 | 0.08454 |
+| 400 | 0.00163 | 0.01106 | 0.12146 |
+| 700 | 0.00318 | 0.02600 | 0.14901 |
+| 800 | 0.00445 | 0.02984 | 0.14335 |
+| 900 | 0.00824 | 0.02419 | 0.11601 |
+| 950 | 0.03066 | 0.01492 | 0.09408 |
+| 990 | 0.13761 | 0.08188 | 0.06475 |
+
+P3では低〜中t(50〜800)でguide利用度が現行bestの6〜8倍に増え、ピークが
+t=990(現行best)からt=700〜800(P3)へ移動した——形状自体が大きく変わった。
+しかし結果1の通り、最終DDIM精度はこれでも動いていない。**P1で見た
+「診断指標は動くが最終精度には転写されない」という構図が、学習データの
+guide品質を底上げしてもなお再現された**(self_target_loss_weight実験に続き
+2例目)。`self_target_attention_rank_1`は全t・現行bestと完全一致の0.911805
+(健全性チェック合格)。
+
+### 結果4: 反事実分解の再実行 — dec12の構造的要因は持続
+
+P2の反事実分解(`pooled_values`/`pooled_context`の入れ替え)を同じ3 timestep
+(200/900/990)でP3チェックポイントに対して再実行。再現性チェックは全ブロック・
+全tでOK。
+
+| block | t | 現行best: context_only% | P3: context_only% | 現行best: values_only% | P3: values_only% |
+|---|---|---|---|---|---|
+| dec12-1 | 200 | -9.28 | -11.68 | -27.44 | -19.65 |
+| dec12-1 | 900 | -6.21 | -4.86 | -7.04 | -5.66 |
+| dec12-1 | 990 | -5.43 | -3.72 | -3.67 | -3.25 |
+| dec12-2 | 200 | -5.84 | -6.58 | -10.39 | -7.77 |
+| dec12-2 | 900 | -2.62 | -2.75 | -6.38 | -6.57 |
+| dec12-2 | 990 | -2.17 | -2.21 | -3.87 | -4.17 |
+
+**P2で立てた問い「P3/P4だけでは解消しない残差リスクか」への答え: その通りだった。**
+dec12固有の構造的な負のcontext感度(`context_only`)は、guide検索方法を変えて
+再学習した後も、ほぼ同じ大きさ・符号で残っている(dec12-1: -3.7〜-11.7%、
+dec12-2: -2.2〜-6.6%、現行bestと同程度)。`values_only`(他ブロックの反応の伝播)
+も同様に残存(やや小さくなったが同じ形状)。
+
+1点、新しい非線形性の兆候: dec12-2のt=200で、`actual`変化(-0.99%)が
+`context_only`(-6.58%)+`values_only`(-7.77%)の単純和(-14.35%)から大きく
+乖離した(現行bestでは概ね加法的だった)。他の5ケースは従来通りほぼ加法的
+(例: dec12-1 t=900は-10.32% vs 和-10.52%)。この1ケースの非線形性は
+P2で見えていなかった新しい手がかりで、P2(dec12局所分析)を実施する場合の
+追加の調査対象になりうる。
+
+### 解釈・判定
+
+1. **P3の仮説(「モデルは品質の低いguideの分布でしか学習していないから、
+   良いguideで学習し直せば改善するはず」)は否定された。** 学習時のguide品質を
+   底上げしても、最終DDIM生成精度・guide追従度のギャップは共にほぼ不変。
+2. 診断レベルの指標(guide_advantage_vs_shuffled、self_target_improvement)は
+   大きく動いた(ピーク位置・大きさとも)にも関わらず、最終精度には転写されない
+   ——self_target_loss_weight実験に続き、**学習データ/損失関数側の介入では
+   診断と最終精度の乖離を埋められない**という構図が2例連続で確認された。
+3. dec12の構造的な負のcontext感度はP3でも解消しなかった——P2で懸念した通り、
+   guide品質/学習データの変更では直らない残差リスクであることが確定した。
+4. これらを総合すると、**P3/P4(学習データ・損失関数側の介入)よりも、
+   P5(condition_fusionの再設計、またはreference_similarity_enabledの有効化)、
+   または「診断指標と最終DDIM精度の乖離そのもの」を直接調べる新しい方向性の
+   優先度が相対的に上がった**と考えられる(アーキテクチャ・推論方式側の問題が
+   主因である可能性が高まった)。
+- 判定: 実装・実行・記録完了。次の一手(P2のdec12局所分析の続き、P5の
+  アーキテクチャ変更、または診断/最終精度の乖離自体の調査)はユーザーの判断を仰ぐ。

@@ -1,8 +1,10 @@
 # GENERATIVE_MODULE_NEXT_STEPS.md — 生成モジュール改善の優先順位付きアクションプラン
 
-**状態: 2026-10-08時点の分析・提案。P1・P2は実行済み(結果は本書§3 P1/P2および
-PROGRESS.mdの該当エントリ参照)。P3以降は未実装・未実行。実行はユーザーの別途
-指示を待つ。**
+**状態: 2026-10-08時点の分析・提案。P1・P2・P3は実行済み(結果は本書§3 P1/P2/P3
+およびPROGRESS.mdの該当エントリ参照)。P3の結果、学習データ・損失関数側の介入
+(P3/P4)では最終DDIM精度も診断/最終精度の乖離も動かせないことが2例連続で確認され、
+P5(アーキテクチャ側)または乖離そのものの調査の優先度が相対的に上がった。
+P4・P5は未実装・未実行。実行はユーザーの別途指示を待つ。**
 
 本書の対象は「通常推論(自己参照ではない)時に、生成結果と検索guideおよび正解targetが
 乖離している」という課題。過去の一連の診断結果とモデル構造(`ReferenceModulatedUNetV2`)を
@@ -21,7 +23,8 @@ PROGRESS.mdの該当エントリ参照)。P3以降は未実装・未実行。実
 | → **FiLM(scale/shift)内訳**(決定的、PROGRESS.md 2026-09-30) | context変化(最大10%)に対しFiLM自体の変化はその1/10〜1/300(0.02〜1%) | ボトルネックは`ReferenceModulatedAttention.condition_fusion` + `ConditionalBlock.film` |
 | `context_residual`追加(アーキテクチャ側、ゼロ初期化の直接残差) | self_target_improvementが**悪化**、FiLM応答は追加前とほぼ変わらず(下記§2参照) | 「経路を増やせば使われる」は不成立 → ボトルネックは容量でなく**学習インセンティブ** |
 | `self_target_loss_weight`(損失関数側、補助損失) | self_target_improvementが445倍に(診断は大成功)、`guide_advantage_vs_shuffled`は符号反転したが事前閾値に僅差未達、**最終DDIM指標(MAE/correlation)は不変** | 診断レベルの改善が最終出力に転写されない |
-| 検索方法の変更(guide品質+27%、本日) | guide_vs_target_MAE大幅改善、**最終DDIM指標はほぼ不変** | retrieval品質はボトルネックの主因ではない |
+| 検索方法の変更(guide品質+27%、2026-10-08) | guide_vs_target_MAE大幅改善、**最終DDIM指標はほぼ不変** | retrieval品質はボトルネックの主因ではない |
+| P3: 検索方法を変えて学習データごと再学習(2026-10-09) | 診断指標(guide_advantage_vs_shuffled等)は6〜8倍に増加・形状も変化、しかし**最終DDIM指標・guide追従度ギャップは共に不変**、dec12のcontext_only起因の負感度も残存 | 学習データ側の介入(検索方法+損失関数)では診断/最終精度の乖離を埋められない。アーキテクチャ側(P5)の優先度が相対的に上がった |
 
 一貫しているのは、**guide側(検索品質)をどう変えても、guide経路側(アーキテクチャ容量)を
 どう変えても最終出力は動かないが、学習の損失関数(インセンティブ)を変えると診断レベルでは
@@ -105,16 +108,41 @@ normal/self_target間で入れ替えて`condition_fusion`+`film`を再計算)に
 反事実分解を再実行して`context_only`の符号・大きさが変化するか確認することを
 推奨(再学習不要・数分で済む低コストな事後チェック)。
 
-### P3(本命・中コスト): 新retrieval方式のguideで学習データ自体を作り直して再学習
+### P3(実行済み・2026-10-09): 新retrieval方式のguideで学習データ自体を作り直して再学習
 
-2026-10-08の発見(guideの質は改善できるが、今のモデルは応答しない)を踏まえると、
-最も筋が通る次の一手は「model_train/model_validationのguideも新しい検索方式
-(`GuideIndex.search_by_history`)で作り直し、`self_target_loss_weight`
-(必要なら重みを1.0から引き上げて再挑戦)と組み合わせて再学習する」こと。理由:
-モデルは**今の(品質の低い)guideの分布でしか学習していない**ため、検索方法だけ変えて
-良いguideを推論時に与えても、モデルにとっては未知の分布で評価していることになり、
-改善しなくて当然とも言える。学習時点からguide品質自体を底上げすれば、`condition_fusion`
-がguideの変動に反応する動機(今は「弱い信号なので無視するのが合理的」)も変わるはず。
+**当初の提案理由(2026-10-08時点)**: 2026-10-08の発見(guideの質は改善できるが、
+今のモデルは応答しない)を踏まえ、「model_train/model_validationのguideも新しい
+検索方式(`GuideIndex.search_by_history`)で作り直し、`self_target_loss_weight`と
+組み合わせて再学習する」ことを提案した。モデルは**今の(品質の低い)guideの分布
+でしか学習していない**ため、検索方法だけ変えて良いguideを推論時に与えても未知の
+分布で評価していることになり、改善しなくて当然とも言える——学習時点からguide品質
+自体を底上げすれば`condition_fusion`がguideの変動に反応する動機も変わるはず、
+という仮説だった。
+
+**実行結果(2026-10-09)**: model_train/model_validation/inference全splitのguideを
+`search_by_history`で作り直し、`self_target_loss_weight=1.0`等、現行bestと完全に
+同一の条件で再学習した(詳細はPROGRESS.md該当エントリ参照)。**この仮説は否定
+された。結論の要約:**
+
+- 最終DDIM生成精度(MAE/correlation/direction_sign_agreement)
+  は現行bestとCI95%がほぼ完全に重複し、有意差なし。guide追従度のギャップ
+  (generated_vs_guide_MAE − guide_vs_target_MAE)も0.0491〜0.0518の範囲でほぼ不変
+  ——学習時にguideを入れ替えても、モデルがguideに追従する度合い自体は変わらない。
+- 診断レベルの指標(guide_advantage_vs_shuffled等)は大きく動いた(低〜中tで
+  現行bestの6〜8倍、ピーク位置もt=990→t=700〜800へ移動)にも関わらず、最終精度には
+  転写されない——`self_target_loss_weight`実験に続き、学習データ/損失関数側の
+  介入では診断と最終精度の乖離を埋められないという構図が2例連続で確認された。
+- **P2のdec12反事実分解を再実行した結果、dec12固有の構造的な負のcontext感度は
+  ほぼ同じ大きさ・符号で残存することを確認**(P2で懸念していた「P3だけでは
+  解消しない残差リスク」が的中)。1点、dec12-2のt=200でcontext_only/values_only
+  単純和と実際の変化が大きく乖離する新しい非線形性も見つかった(他は従来通り
+  ほぼ加法的)。
+
+次の一手: P3/P4(学習データ・損失関数側の介入)よりも、P5(condition_fusionの
+再設計、`reference_similarity_enabled`の有効化)、または「診断指標と最終DDIM
+精度の乖離そのもの」を直接調べる新しい方向性の優先度が相対的に上がったと考えられる
+——アーキテクチャ・推論方式側の問題が主因である可能性が高まったため。どちらに
+進むかはユーザーの判断を仰ぐ。
 
 ### P4(中コスト): self_target_loss_weightを「二値」から「段階的」に
 
