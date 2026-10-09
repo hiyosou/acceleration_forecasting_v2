@@ -1531,3 +1531,85 @@ t=900固有の現象ではなく、DDIM軌道全体を通じて一貫した構�
 - 判定: 実装・実行・記録完了(コード変更なし、既存ツールの新しい使い方のみ)。
   次の一手(P2としてdec12/dec6-2の局所的な深掘りに進むか、P3としてguideの質と
   学習データを変えた再学習に進むか)はユーザーの判断を仰ぐ。
+
+## [2026-10-09] P2: dec12のFiLM符号反転を反事実的分解で切り分け — 実行結果
+
+`GENERATIVE_MODULE_NEXT_STEPS.md`のP2。P1で、出口直前のdec12-1/dec12-2のFiLM
+(`scale_norm`)応答が、他の全8ブロックと逆方向(self_target時にむしろ縮む)に
+動くことが、検証した全12 timestepで一貫する構造的な現象であることが確定した。
+P2では、**なぜdec12だけ逆方向に動くのか**を、再学習・アーキテクチャ変更なしで
+切り分けた。
+
+### 手法: 反事実的(counterfactual)な入れ替え
+
+`ReferenceModulatedAttention.forward`では、`condition_fusion`への入力は
+`cat([pooled_values, condition, pooled_context])`であり、`condition`(history+time
+embedding)は全ブロックで同一値(ブロック間で変化しない)、`pooled_values`(その
+ブロックの特徴マップ)と`pooled_context`(そのブロックのattentionが集めたguide文脈)
+だけがブロックごとに異なる。forward pre-hookで`condition_fusion`への入力を
+normal/self_targetそれぞれで捕捉し、`pooled_values`/`pooled_context`を入れ替えた
+4パターンで`condition_fusion`+`film`を直接再計算した(現行best checkpoint、
+model_validation全件、t=200/900/990の3点):
+
+| 組み合わせ | pooled_values | pooled_context | 意味 |
+|---|---|---|---|
+| actual_normal/actual_self_target | 対応 | 対応 | 既存block_breakdown CSVの検証用(再現性チェック) |
+| **context_only** | normal | self_target | guideの質だけを上げた純粋な効果 |
+| **values_only** | self_target | normal | 上流ブロックの特徴マップ変化だけによる効果 |
+
+再現性チェック: 全ブロック・全3 timestepで`actual_normal`/`actual_self_target`の
+scale_normが既存`block_breakdown_t{200,900,990}.csv`の値と誤差1e-5未満で一致
+(フック配線が正しいことを確認)。
+
+### 結果: dec12の反転はcontext起因とvalues起因の「両方」、ほぼ加法的に寄与
+
+| block | t | actual変化% | context_only% | values_only% | context+values(和) |
+|---|---|---|---|---|---|
+| dec12-1 | 200 | -33.16 | -9.28 | **-27.44** | -36.72 |
+| dec12-1 | 900 | -13.05 | -6.21 | -7.04 | -13.25 |
+| dec12-1 | 990 | -9.01 | **-5.43** | -3.67 | -9.10 |
+| dec12-2 | 200 | -7.61 | -5.84 | **-10.39** | -16.23 |
+| dec12-2 | 900 | -8.57 | -2.62 | **-6.38** | -9.00 |
+| dec12-2 | 990 | -5.90 | -2.17 | **-3.87** | -6.04 |
+
+`actual`変化%は`context_only%+values_only%`の単純和とほぼ一致する(非線形な
+相互作用はわずか)。つまりdec12の反転は、独立した2つの要因がほぼ加法的に重なった
+結果だと分かった:
+
+1. **context_only(guide文脈起因)は全6ケースで例外なく負、かつ比較的小さく
+   timestepに対して緩やかにしか変化しない**(dec12-1: -5.4〜-9.3%、dec12-2:
+   -2.2〜-5.8%)。これは`condition_fusion`/`film`がdec12という位置で、guide文脈の
+   変化に対し構造的に負の感度を学習したことを示す(Hypothesis A、純粋なモデル側の
+   問題)。
+2. **values_only(上流ブロックの特徴マップ変化起因)は負で、かつ低tで急激に大きく
+   なる**(dec12-1: t=200で-27.4%、t=990で-3.7%)。これはP1で既に見えていた
+   「他の全ブロックのFiLM相対変化は低tで最大になる」というパターン(dec6-2が
+   t=200で+153%等)が、skip connection経由でdec12の`pooled_values`に伝播した
+   結果と考えられる(Hypothesis B、他ブロックの強い反応の「おこぼれ」)。
+
+低t(200)ではvalues_only(他ブロックの反応の伝播)が反転の主因、高t(990)では
+context_only(dec12固有の構造的要因)の寄与がvalues_onlyと同程度かそれを上回る
+(dec12-1: t=990でcontext -5.43% vs values -3.67%)。
+
+### 補足: 静的重み分析(アーキテクチャ対称性チェック)
+
+enc12とdec12はchannels=64で構造的に対称なブロックだが、`condition_fusion`の
+`pooled_context`列ノルム比率(enc12: 0.249〜0.251、dec12: 0.251〜0.254)、
+`film`のscale/shift行ノルム(enc12: 4.81〜4.83、dec12: 4.84〜4.85)はほぼ同一で、
+**容量や重みの大きさに質的な違いはない**(符号・方向性の問題であり、クイックな
+weight-norm比較では検出できない)。
+
+### 解釈
+
+1. dec12の反転は**単一の原因ではなく、dec12固有の構造的な負の感度(小さいが
+   全tで一貫)と、他ブロックの強いself_target反応がskip connection経由で伝播した
+   副作用(大きいが高tで消える)の、ほぼ独立な合算**であることが判明した。
+2. 低tでの反転の大きさの大部分は「dec12固有」ではなく「他ブロックの反応が強すぎる
+   ことの伝播」で説明できる。これはP3/P4(学習インセンティブの是正)が成功すれば、
+   副次的に低tでのdec12反転も和らぐ可能性を示唆する。
+3. 一方でcontext_only(dec12固有の構造的要因)は全tで一貫して負であり、P3/P4だけでは
+   解消しない残差リスクとして残る。P3実行後に同じ反事実分解を再実行し、
+   context_onlyの符号・大きさが変化するか確認する価値がある(再学習不要・数分で
+   済む低コストな検証のため、P3の事後チェックとして組み込むことを推奨)。
+- 判定: 実装・実行・記録完了(コード変更・再学習なし)。次はP3(guide検索方法を
+  変えたmodel_train/model_validationの再構築+再学習)に進む想定。
