@@ -132,11 +132,11 @@ def test_run_summary_records_configuration(trained, tmp_path):
 
 
 def test_run_summary_records_start_timestep(trained, tmp_path):
-    assert _predict(trained, tmp_path / "default")["start_timestep"] == 999
-    summary = _predict(trained, tmp_path / "shifted", start_timestep=978)
-    assert summary["start_timestep"] == 978
-    written = json.loads((tmp_path / "shifted" / "prediction_run.json").read_text(encoding="utf-8"))
-    assert written["start_timestep"] == 978
+    assert _predict(trained, tmp_path / "default")["start_timestep"] == 958
+    summary = _predict(trained, tmp_path / "legacy", start_timestep=999)
+    assert summary["start_timestep"] == 999
+    written = json.loads((tmp_path / "legacy" / "prediction_run.json").read_text(encoding="utf-8"))
+    assert written["start_timestep"] == 999
 
 
 def test_mixed_precision_is_off_on_cpu_by_default(trained, tmp_path):

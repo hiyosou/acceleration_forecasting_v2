@@ -71,8 +71,8 @@ def _parser():
     p.add_argument("--num-samples", type=int, default=100)
     p.add_argument("--sampling-steps", type=int, default=50)
     p.add_argument("--start-timestep", type=int,
-                   help="DDIMの最初のtimestep(省略時は拡散ステップ数−1=999)。"
-                        "epsilonではt=999でx0推定が悪条件になるため、手前から始めるときに指定する")
+                   help="DDIMの最初のtimestep(省略時は958)。epsilonではt=999でx0推定が悪条件になるため"
+                        "既定で手前から始める。2026-10-14以前の結果を再現するときは999を指定する")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device")
     p.add_argument("--guide-mode", choices=("retrieved", "self_target"), default="retrieved",

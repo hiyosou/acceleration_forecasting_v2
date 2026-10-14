@@ -20,6 +20,11 @@ import numpy as np
 import torch
 
 
+# DDIMの既定の開始timestep。1000ステップのcosineスケジュールで、inference全件の比較
+# (999/978/958/938/900)から選んだ値(2026-10-14、PROGRESS.md参照)。
+DEFAULT_START_TIMESTEP = 958
+
+
 def cosine_alpha_bars(steps=1000, offset=0.008):
     times = torch.linspace(0, steps, steps + 1, dtype=torch.float64) / steps
     values = torch.cos((times + offset) / (1 + offset) * np.pi / 2).square()
@@ -101,16 +106,17 @@ class DiffusionProcess:
              start_timestep=None):
         """DDIMサンプリング。
 
-        start_timestep: 最初のステップのtimestep(Noneなら`steps - 1`=999で従来と同一)。
-            cosineスケジュールの終端はᾱ_999≈2.4e-9で、epsilon→x0の変換が誤差を約2万倍に
-            拡大する(x0がクリップ上限に張り付き、水準が過大になる)。これを避けるために
-            開始を手前にずらせるようにしている。GENERATIVE_MODULE_NEXT_STEPS.md §0.3参照。
+        start_timestep: 最初のステップのtimestep(Noneなら`DEFAULT_START_TIMESTEP`、
+            ただし`steps - 1`を超えない)。cosineスケジュールの終端はᾱ_999≈2.4e-9で、
+            epsilon→x0の変換が誤差を約2万倍に拡大する(x0がクリップ上限に張り付き、水準が
+            過大になる)。これを避けるため既定では手前から始める。2026-10-14以前の結果を
+            再現するときは`start_timestep=999`を指定する。GENERATIVE_MODULE_NEXT_STEPS.md §0.3参照。
         """
         device = batch["history_values"].device
         values = float(initial_noise_scale) * torch.randn(shape, device=device, generator=generator)
         if int(sampling_steps) <= 0 or int(sampling_steps) > self.steps:
             raise ValueError("sampling_steps must be between 1 and diffusion steps")
-        start = self.steps - 1 if start_timestep is None else int(start_timestep)
+        start = min(DEFAULT_START_TIMESTEP, self.steps - 1) if start_timestep is None else int(start_timestep)
         if start < 0 or start > self.steps - 1:
             raise ValueError("start_timestep must be between 0 and diffusion steps - 1")
         if int(sampling_steps) > start + 1:

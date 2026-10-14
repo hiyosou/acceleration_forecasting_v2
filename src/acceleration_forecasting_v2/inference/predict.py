@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
 from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
-from acceleration_forecasting_v2.diffusion.process import DiffusionProcess
+from acceleration_forecasting_v2.diffusion.process import DEFAULT_START_TIMESTEP, DiffusionProcess
 from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
 
 
@@ -63,7 +63,8 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
 
     mixed_precision: Noneならcudaのときだけbf16 autocastを使う(学習と同じ精度設定)。
 
-    start_timestep: DDIMの最初のtimestep(Noneなら拡散ステップ数−1、`DiffusionProcess.ddim`参照)。
+    start_timestep: DDIMの最初のtimestep(Noneなら`DEFAULT_START_TIMESTEP`=958、
+        `DiffusionProcess.ddim`参照)。2026-10-14以前の結果の再現には999を指定する。
 
     Returns:
         サマリdict(件数・設定)。
@@ -123,7 +124,7 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     summary = {
         "split": split, "record_count": int(len(samples)), "num_samples": int(num_samples),
         "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed),
-        "start_timestep": int(process.steps - 1 if start_timestep is None else start_timestep),
+        "start_timestep": int(min(DEFAULT_START_TIMESTEP, process.steps - 1) if start_timestep is None else start_timestep),
         "prediction_type": config["prediction_type"], "bounds": [float(bounds[0]), float(bounds[1])],
         "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema), "mixed_precision": bool(use_autocast),
         "guide_mode": guide_mode,

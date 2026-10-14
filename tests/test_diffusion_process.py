@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import pytest
 
-from acceleration_forecasting_v2.diffusion.process import DiffusionProcess, cosine_alpha_bars
+from acceleration_forecasting_v2.diffusion.process import DEFAULT_START_TIMESTEP, DiffusionProcess, cosine_alpha_bars
 from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
 
 
@@ -129,15 +129,27 @@ class _RecordingModel(_ConstantModel):
         return super().forward(noisy, timesteps, batch)
 
 
-def test_ddim_start_timestep_none_matches_explicit_999():
+def test_default_start_timestep_is_958():
+    # 2026-10-14の全件比較で選んだ値。変更するときはPROGRESS.mdの記録と合わせること。
+    assert DEFAULT_START_TIMESTEP == 958
+
+
+def test_ddim_start_timestep_none_matches_explicit_default():
     model = ReferenceModulatedUNetV2()
     model.eval()
     process = DiffusionProcess(model, steps=1000, prediction_type="epsilon")
     batch = _dummy_batch(batch_size=2)
     default = process.ddim(batch, shape=(2, 12), sampling_steps=5, generator=torch.Generator().manual_seed(0))
     explicit = process.ddim(batch, shape=(2, 12), sampling_steps=5, generator=torch.Generator().manual_seed(0),
-                            start_timestep=999)
+                            start_timestep=DEFAULT_START_TIMESTEP)
     torch.testing.assert_close(default, explicit)
+
+
+def test_ddim_default_start_is_capped_for_short_schedules():
+    model = _RecordingModel()
+    DiffusionProcess(model, steps=100, prediction_type="epsilon").ddim(
+        _dummy_batch(batch_size=1), shape=(1, 12), sampling_steps=5)
+    assert model.timesteps[0] == 99
 
 
 def test_ddim_starts_from_start_timestep():
@@ -151,7 +163,12 @@ def test_ddim_starts_from_start_timestep():
     default_model = _RecordingModel()
     DiffusionProcess(default_model, steps=1000, prediction_type="epsilon").ddim(
         _dummy_batch(batch_size=1), shape=(1, 12), sampling_steps=5)
-    assert default_model.timesteps[0] == 999
+    assert default_model.timesteps[0] == DEFAULT_START_TIMESTEP
+
+    legacy_model = _RecordingModel()
+    DiffusionProcess(legacy_model, steps=1000, prediction_type="epsilon").ddim(
+        _dummy_batch(batch_size=1), shape=(1, 12), sampling_steps=5, start_timestep=999)
+    assert legacy_model.timesteps[0] == 999
 
 
 def test_ddim_rejects_invalid_start_timestep():
