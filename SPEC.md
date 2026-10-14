@@ -188,6 +188,16 @@ segment_level_mean = ( Σ_{s∈S} segment_mean_s ) / |S|  # 第2段階: セグ�
 
 **bootstrap CIも同じ2段階構造にする**必要がある。現行の`evaluate()`([evaluation/evaluate.py:93-99](../acceleration_forecasting_12m/src/acceleration_forecasting_12m/evaluation/evaluate.py#L93-L99))は「どのセグメントを再抽出するか」はセグメント単位だが、集計はrecord単位の重み付き平均のままだった(壁打ちで確認済みの問題点)。record-level出力用のbootstrapは現行のまま(record単位集計)、segment-level出力用のbootstrapは、各反復で`segment_mean_s`を計算してから`|S|`個の値の単純平均を取る、という2段階に修正する。
 
+**追記(2026-10-14): 素朴なベースラインとの比較を常設する。** `evaluate()`は、モデルの指標と並べて
+3つのベースライン(`evaluation/baselines.py`: current値の横ばい`persistence`、履歴最大値の横ばい
+`history_max`、`model_train`で学習する履歴特徴のridge回帰`history_ridge`)のMAEと、レコードごとの差
+`MAE_minus_<name>`(モデルMAE − ベースラインMAE)を出力する。差の列も上記と同じ2段階集計・bootstrapに
+乗せるため、その信頼区間はそのまま対応ありの差の95%CIになる。`evaluation_summary.json`の
+`baseline_comparison`に、segment-levelの差・CI・判定(`better`/`worse`/`no_significant_difference`)を
+まとめる。**モデル変更は、`history_ridge`に対する判定が`better`でなければ改善とみなさない**
+(経緯はGENERATIVE_MODULE_NEXT_STEPS.md §0)。既存の`baseline_MAE`(guide平均)は、guide自体の質の
+参考値として残す。
+
 ---
 
 ## 1.5 epsilon / v_predictionの並行比較の実行方式

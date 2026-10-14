@@ -20,6 +20,12 @@ METRIC_NAMES = (
     "adjacent_difference_MAE", "direction_sign_agreement", "ensemble_mean_std",
 )
 BASELINE_METRIC_NAMES = ("baseline_MAE", "baseline_RMSE")
+# 素朴なベースライン(`evaluation/baselines.py`)のMAEと、モデルとの差(モデルMAE − ベースラインMAE)。
+# 差の列をbootstrapすると、そのまま対応ありの差の信頼区間になる。
+REFERENCE_BASELINES = ("persistence", "history_max", "history_ridge")
+REFERENCE_METRIC_NAMES = tuple(f"{name}_MAE" for name in REFERENCE_BASELINES) + tuple(
+    f"MAE_minus_{name}" for name in REFERENCE_BASELINES
+)
 
 
 def _present(frame, names):

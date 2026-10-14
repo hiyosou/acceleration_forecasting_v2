@@ -1826,3 +1826,44 @@ start=999のMAEが既存の0.2127より高いのは、中央値を取るサン�
 `GENERATIVE_MODULE_NEXT_STEPS.md` §0の見立てどおり、guideに情報がない限りこれ以上の改善は見込みにくい。
 過去のepsilon系の実験結果(context_residual・self_target_loss_weight・P3)は、いずれも
 start=999で評価されており、約+0.06のバイアスを含む(相互比較は同条件なので有効)。
+
+## [2026-10-14] 検証2: 素朴なベースラインを評価に常設(GENERATIVE_MODULE_NEXT_STEPS.md R1)
+
+これまで`evaluate`の比較対象はguide平均(`baseline_MAE`)だけで、モデルが素朴な予測器に
+勝っているかが分からなかった。`evaluate`を実行するだけで、対応ありの95%CI付きで分かるようにした。
+
+### 実装
+- 新規`evaluation/baselines.py`: `persistence`(current値=履歴の最後の有効値を横ばい)、
+  `history_max`(履歴の有効月の最大値を横ばい)、`history_ridge`(履歴特徴+anchor月のone-hot、
+  月ごとに12本、λ=1、segment_weight付き。同じdataset_dirの`model_train`でその場で学習、数秒)。
+  `model_train`が無い場合はridgeだけ省略してwarning。anchor月は学習・予測の両方のmetadataに
+  `anchor_date`列があるときだけ使う。
+- `evaluate.per_target_frame`: レコードごとに`<name>_MAE`と`MAE_minus_<name>`を追加。
+  既存の2段階集計・bootstrapにそのまま乗るので、差の列のCIが対応ありの差の95%CIになる。
+- `evaluation_summary.json`に`baseline_comparison`(segment-levelの差・CI・判定)を追加。
+- `build_comparison_table`にも新しい列を載せる(計画では「無変更でよい」としていたが、
+  指標名リストを参照する作りだったため修正が必要だった)。
+- SPEC.md 1.4に追記。テスト322件パス(新規`tests/test_baselines.py`ほか)。
+
+### 実データでの確認(inference 1,119件・116セグメント、bootstrap 1000回)
+3つの予測結果を再評価した: P3開始958(`eval_start958_n100`、上書き。既存の指標は不変でMAE 0.1932)、
+現行best開始958(同)、v_prediction既存`pred`(新規`eval_with_baselines/`、既存の`eval/`は残す)。
+比較表: `artifacts/comparisons/baselines_20261014.csv`。
+
+ベースラインのMAE(record-level)は10-13分析と一致: persistence 0.2174、history_max 0.2024、
+history_ridge 0.1897(`dataset`と`dataset_history_search_v2`で同値)。
+
+| モデル(MAE) | vs persistence | vs history_max | vs history_ridge |
+|---|---|---|---|
+| P3 開始958(0.1932) | −0.0246 [−0.0331, −0.0150] better | −0.0090 [−0.0163, −0.0023] better | +0.0037 [−0.0003, +0.0078] 有意差なし |
+| 現行best 開始958(0.1931) | −0.0246 [−0.0333, −0.0149] better | −0.0090 [−0.0163, −0.0020] better | +0.0037 [−0.0000, +0.0075] 有意差なし |
+| v_prediction(0.1932) | −0.0246 [−0.0335, −0.0148] better | −0.0090 [−0.0162, −0.0022] better | +0.0037 [−0.0002, +0.0077] 有意差なし |
+
+(segment-levelの差 = モデルMAE − ベースラインMAE、負ならモデルが良い。)
+
+### 判定
+- 拡散モデルは学習不要の2つには有意に勝つが、**履歴ridgeには勝てない**(点推定ではridgeが0.004良く、
+  CIの下限はほぼ0)。3モデルとも同じ結果で、guideの有無・prediction_typeに関係なく
+  「履歴から水準を当てる」以上のことはできていない(10-13分析の結論と整合)。
+- 合格基準: **今後のモデル変更は、`baseline_comparison.history_ridge.verdict`が`better`で
+  なければ改善とみなさない。**

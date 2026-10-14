@@ -195,6 +195,35 @@ def test_evaluate_includes_guide_baseline_metrics_as_reference(tmp_path):
     assert "record_level_ci" not in summary
 
 
+def test_evaluate_reports_reference_baselines_and_paired_differences(tmp_path):
+    dataset_dir, raw = _write_eval_dataset(tmp_path)
+    prediction_dir = _write_predictions(tmp_path, raw, [0.0] * 5)  # 正解そのもの(MAE 0)
+    summary = evaluate(dataset_dir, prediction_dir, tmp_path / "out", bootstrap=50)
+    frame = pd.read_csv(tmp_path / "out" / "evaluation_per_target.csv")
+    for name in ("persistence", "history_max", "history_ridge"):
+        assert f"{name}_MAE" in frame.columns
+        np.testing.assert_allclose(frame[f"MAE_minus_{name}"], frame["MAE"] - frame[f"{name}_MAE"])
+        comparison = summary["baseline_comparison"][name]
+        assert comparison["delta_MAE"] == pytest.approx(summary["segment_level"][f"MAE_minus_{name}"])
+    # 正解そのものの予測は、傾きを表せない現状維持より有意に良い。
+    assert summary["baseline_comparison"]["persistence"]["verdict"] == "better"
+    assert summary["baseline_comparison"]["persistence"]["delta_MAE_ci95_high"] < 0
+    # 既存のguide平均ベースラインは変わらない。
+    assert summary["record_level"]["baseline_MAE"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_baseline_comparison_verdict_follows_ci_sign():
+    from acceleration_forecasting_v2.evaluation.evaluate import _baseline_comparison
+    level = {"persistence_MAE": 0.2, "MAE_minus_persistence": 0.05,
+             "history_max_MAE": 0.2, "MAE_minus_history_max": -0.01}
+    ci = {"MAE_minus_persistence_ci95_low": 0.01, "MAE_minus_persistence_ci95_high": 0.09,
+          "MAE_minus_history_max_ci95_low": -0.03, "MAE_minus_history_max_ci95_high": 0.01}
+    result = _baseline_comparison(level, ci)
+    assert result["persistence"]["verdict"] == "worse"
+    assert result["history_max"]["verdict"] == "no_significant_difference"
+    assert "history_ridge" not in result
+
+
 def test_evaluate_excludes_records_with_too_few_valid_target_months(tmp_path):
     dataset_dir, raw = _write_eval_dataset(tmp_path, mask_first_record_after=4)
     prediction_dir = _write_predictions(tmp_path, raw, [0.1] * 5)
@@ -222,3 +251,14 @@ def test_build_comparison_table_lays_out_both_levels_for_each_run():
                                    "v_prediction|record_level", "v_prediction|segment_level"]
     assert table.loc["MAE", "epsilon|segment_level"] == pytest.approx(0.8)
     assert table.loc["MAE", "v_prediction|record_level"] == pytest.approx(0.3)
+
+
+def test_build_comparison_table_includes_reference_baselines_when_all_runs_have_them():
+    def summary(mae, with_reference):
+        names = ("MAE",) + (("history_ridge_MAE", "MAE_minus_history_ridge") if with_reference else ())
+        return {"record_level": {n: mae for n in names}, "segment_level": {n: mae for n in names}}
+    table = build_comparison_table({"a": summary(0.2, True), "b": summary(0.3, True)})
+    assert {"history_ridge_MAE", "MAE_minus_history_ridge"} <= set(table.index)
+    # 新しい列を持たない古い評価結果と並べたときは、共通の指標だけになる。
+    mixed = build_comparison_table({"a": summary(0.2, True), "old": summary(0.3, False)})
+    assert "history_ridge_MAE" not in mixed.index

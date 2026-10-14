@@ -4,6 +4,9 @@
 旧`evaluation/evaluate.py`との違い: 過去実験どうしの比較表・画像出力・
 複数の実験ツリーを横断する処理は持たない(成果物の乱立を防ぐ方針)。
 モデル間の比較は`build_comparison_table`に各runのsummaryを渡して行う(SPEC 1.5)。
+
+素朴なベースライン(`evaluation/baselines.py`: 現状維持・履歴最大値・履歴ridge)のMAEと、
+モデルとの差(対応あり)を常に並べて出力する(2026-10-14追加、`baseline_comparison`)。
 """
 
 from __future__ import annotations
@@ -15,9 +18,10 @@ import numpy as np
 import pandas as pd
 
 from .aggregate import (
-    BASELINE_METRIC_NAMES, METRIC_NAMES, bootstrap_record_level, bootstrap_segment_level,
-    confidence_interval, evaluate_record_level, evaluate_segment_level, segment_means,
+    BASELINE_METRIC_NAMES, METRIC_NAMES, REFERENCE_BASELINES, REFERENCE_METRIC_NAMES, bootstrap_record_level,
+    bootstrap_segment_level, confidence_interval, evaluate_record_level, evaluate_segment_level, segment_means,
 )
+from .baselines import baseline_predictions
 from .metrics import target_metrics
 
 
@@ -35,6 +39,7 @@ def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_targ
     masks = np.load(split_dir / "target_masks.npy")
     baselines = np.load(split_dir / "guide_baselines.npy")
     predictions = pd.read_csv(prediction_dir / "predictions.csv", encoding="utf-8-sig")
+    reference_predictions = baseline_predictions(dataset_dir, split)
     lookup = {str(trend_id): index for index, trend_id in enumerate(metadata["trend_id"])}
 
     rows, without_valid_target = [], 0
@@ -49,12 +54,18 @@ def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_targ
             without_valid_target += 1
             continue
         baseline = target_metrics(targets[index], masks[index], baselines[index], baselines[index], baselines[index])
+        reference = {}
+        for name, values in reference_predictions.items():
+            result = target_metrics(targets[index], masks[index], values[index], values[index], values[index])
+            reference_mae = result["MAE"] if result is not None else np.nan
+            reference[f"{name}_MAE"] = reference_mae
+            reference[f"MAE_minus_{name}"] = metrics["MAE"] - reference_mae
         row = metadata.iloc[index]
         rows.append({
             "trend_id": trend_id, "dataset_id": row["dataset_id"],
             **{key: row[key] for key in ("direction", "bin_start_m", "anchor_date") if key in metadata.columns},
             "ensemble_mean_std": float(pd.to_numeric(ordered["prediction_std"], errors="coerce").mean()),
-            "baseline_MAE": baseline["MAE"], "baseline_RMSE": baseline["RMSE"], **metrics,
+            "baseline_MAE": baseline["MAE"], "baseline_RMSE": baseline["RMSE"], **reference, **metrics,
         })
     all_frame = pd.DataFrame(rows)
     frame = all_frame.loc[all_frame["valid_months"] >= int(min_target_months)].copy() if len(all_frame) else all_frame
@@ -71,7 +82,7 @@ def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_
     frame, counts = per_target_frame(dataset_dir, prediction_dir, split=split, min_target_months=min_target_months)
     if frame.empty:
         raise ValueError("評価対象のレコードがありません(min_target_monthsを満たすレコードが0件)。")
-    names = METRIC_NAMES + BASELINE_METRIC_NAMES
+    names = METRIC_NAMES + BASELINE_METRIC_NAMES + REFERENCE_METRIC_NAMES
     frame.to_csv(output_dir / "evaluation_per_target.csv", index=False, encoding="utf-8-sig")
     segment_means(frame, names).to_csv(output_dir / "evaluation_per_segment.csv", encoding="utf-8-sig")
 
@@ -89,8 +100,28 @@ def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_
         segment_boot.to_csv(output_dir / "bootstrap_segment_level.csv", index=False)
         summary["record_level_ci"] = confidence_interval(record_boot)
         summary["segment_level_ci"] = confidence_interval(segment_boot)
+        summary["baseline_comparison"] = _baseline_comparison(summary["segment_level"], summary["segment_level_ci"])
     (output_dir / "evaluation_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def _baseline_comparison(segment_level, segment_level_ci):
+    """素朴なベースラインごとに、モデルとのMAE差(segment-level、対応あり)と95%CI・判定をまとめる。
+
+    判定: CI上限<0なら"better"(モデルが有意に良い)、下限>0なら"worse"、それ以外は
+    "no_significant_difference"。モデル変更は`history_ridge`に対して"better"でなければ
+    改善とみなさない(GENERATIVE_MODULE_NEXT_STEPS.md §0.5 R1)。
+    """
+    comparison = {}
+    for name in REFERENCE_BASELINES:
+        key = f"MAE_minus_{name}"
+        if key not in segment_level:
+            continue
+        low, high = segment_level_ci[f"{key}_ci95_low"], segment_level_ci[f"{key}_ci95_high"]
+        verdict = "better" if high < 0 else "worse" if low > 0 else "no_significant_difference"
+        comparison[name] = {"baseline_MAE": segment_level[f"{name}_MAE"], "delta_MAE": segment_level[key],
+                            "delta_MAE_ci95_low": low, "delta_MAE_ci95_high": high, "verdict": verdict}
+    return comparison
 
 
 def _percentile_stats(values):
@@ -181,7 +212,7 @@ def build_comparison_table(summaries: dict) -> pd.DataFrame:
 
     SPEC 1.5: 比較表はrecord-levelとsegment-levelの両方を並べる。
     """
-    metrics = [name for name in METRIC_NAMES + BASELINE_METRIC_NAMES
+    metrics = [name for name in METRIC_NAMES + BASELINE_METRIC_NAMES + REFERENCE_METRIC_NAMES
                if all(name in summary["record_level"] for summary in summaries.values())]
     table = {}
     for run, summary in summaries.items():
