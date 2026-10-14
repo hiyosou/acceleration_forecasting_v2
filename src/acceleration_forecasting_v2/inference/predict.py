@@ -49,7 +49,7 @@ def _expand(batch, num_samples):
 def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", device=None,
             num_samples=100, sampling_steps=50, eta=0.0, initial_noise_scale=1.0,
             batch_size=8, seed=42, use_ema=True, bounds=(PHYSICAL_MIN, PHYSICAL_MAX), mixed_precision=None,
-            guide_mode="retrieved"):
+            guide_mode="retrieved", start_timestep=None):
     """指定splitの全レコードを予測し、predictions.csvとsamples.npzを書き出す。
 
     guide_mode="retrieved"(既定)のとき、正解(target_values)は一切読み込まない
@@ -62,6 +62,8 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     では正解は一切読み込まれない、という既存の安全性は変わらない。
 
     mixed_precision: Noneならcudaのときだけbf16 autocastを使う(学習と同じ精度設定)。
+
+    start_timestep: DDIMの最初のtimestep(Noneなら拡散ステップ数−1、`DiffusionProcess.ddim`参照)。
 
     Returns:
         サマリdict(件数・設定)。
@@ -96,6 +98,7 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
             normalized = process.ddim(
                 _expand(batch, num_samples), shape=(size * num_samples, 12), sampling_steps=sampling_steps,
                 eta=eta, normalized_clip=normalized_clip, generator=generator, initial_noise_scale=initial_noise_scale,
+                start_timestep=start_timestep,
             )
         physical = dataset.physical_prediction(normalized.float().cpu().numpy(), bounds=bounds)
         all_samples.append(physical.reshape(size, num_samples, 12))
@@ -120,6 +123,7 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     summary = {
         "split": split, "record_count": int(len(samples)), "num_samples": int(num_samples),
         "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed),
+        "start_timestep": int(process.steps - 1 if start_timestep is None else start_timestep),
         "prediction_type": config["prediction_type"], "bounds": [float(bounds[0]), float(bounds[1])],
         "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema), "mixed_precision": bool(use_autocast),
         "guide_mode": guide_mode,

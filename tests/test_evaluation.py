@@ -22,6 +22,7 @@ from acceleration_forecasting_v2.evaluation.metrics import target_metrics
 def test_target_metrics_hand_computed_example():
     m = target_metrics([1, 2, 3, 4], [1, 1, 1, 1], [1, 2, 3, 5], [0, 1, 2, 3], [2, 3, 4, 4.5])
     assert m["MAE"] == pytest.approx(0.25)
+    assert m["mean_error"] == pytest.approx(0.25)
     assert m["MSE"] == pytest.approx(0.25)
     assert m["RMSE"] == pytest.approx(0.5)
     assert m["peak_value_error"] == pytest.approx(1.0)
@@ -39,6 +40,13 @@ def test_target_metrics_ignores_masked_months():
     m = target_metrics(actual, [1, 1, 0, 0], [1.5, 2.5, 99, 99], [0, 0, 0, 0], [9, 9, 9, 9])
     assert m["valid_months"] == 2
     assert m["MAE"] == pytest.approx(0.5)  # 99は無視される
+
+
+def test_target_metrics_mean_error_keeps_sign_and_ignores_masked_months():
+    # 誤差は[+1, -0.5](3番目はmask=0で除外)→ MAEは0.75だが、符号付き平均は+0.25。
+    m = target_metrics([1.0, 2.0, 3.0], [1, 1, 0], [2.0, 1.5, 99.0], [0, 0, 0], [9, 9, 9])
+    assert m["MAE"] == pytest.approx(0.75)
+    assert m["mean_error"] == pytest.approx(0.25)
 
 
 def test_target_metrics_returns_none_when_no_valid_month():

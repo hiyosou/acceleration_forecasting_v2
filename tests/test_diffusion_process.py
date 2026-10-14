@@ -117,6 +117,55 @@ def test_ddim_rejects_sampling_steps_out_of_range():
         process.ddim(batch, shape=(1, 12), sampling_steps=2000)
 
 
+class _RecordingModel(_ConstantModel):
+    """呼ばれたtimestepを記録する固定出力モデル。"""
+
+    def __init__(self, value=0.0):
+        super().__init__(value)
+        self.timesteps = []
+
+    def forward(self, noisy, timesteps, batch):
+        self.timesteps.append(int(timesteps[0]))
+        return super().forward(noisy, timesteps, batch)
+
+
+def test_ddim_start_timestep_none_matches_explicit_999():
+    model = ReferenceModulatedUNetV2()
+    model.eval()
+    process = DiffusionProcess(model, steps=1000, prediction_type="epsilon")
+    batch = _dummy_batch(batch_size=2)
+    default = process.ddim(batch, shape=(2, 12), sampling_steps=5, generator=torch.Generator().manual_seed(0))
+    explicit = process.ddim(batch, shape=(2, 12), sampling_steps=5, generator=torch.Generator().manual_seed(0),
+                            start_timestep=999)
+    torch.testing.assert_close(default, explicit)
+
+
+def test_ddim_starts_from_start_timestep():
+    model = _RecordingModel()
+    process = DiffusionProcess(model, steps=1000, prediction_type="epsilon")
+    process.ddim(_dummy_batch(batch_size=1), shape=(1, 12), sampling_steps=5, start_timestep=978)
+    assert model.timesteps[0] == 978
+    assert model.timesteps[-1] == 0
+    assert len(model.timesteps) == 5
+
+    default_model = _RecordingModel()
+    DiffusionProcess(default_model, steps=1000, prediction_type="epsilon").ddim(
+        _dummy_batch(batch_size=1), shape=(1, 12), sampling_steps=5)
+    assert default_model.timesteps[0] == 999
+
+
+def test_ddim_rejects_invalid_start_timestep():
+    process = DiffusionProcess(_ConstantModel(0.0), steps=1000, prediction_type="epsilon")
+    batch = _dummy_batch(batch_size=1)
+    with pytest.raises(ValueError, match="start_timestep"):
+        process.ddim(batch, shape=(1, 12), sampling_steps=5, start_timestep=1000)
+    with pytest.raises(ValueError, match="start_timestep"):
+        process.ddim(batch, shape=(1, 12), sampling_steps=5, start_timestep=-1)
+    # 開始が小さすぎるとtimestepが重複するため拒否する。
+    with pytest.raises(ValueError, match="start_timestep"):
+        process.ddim(batch, shape=(1, 12), sampling_steps=50, start_timestep=10)
+
+
 def test_ddim_single_step_output_equals_clamped_predicted_clean():
     # sampling_steps=1・eta=0では、next_timestep=-1(next_alpha=1.0, sigma=0, direction=0)
     # となり、最終出力は「クランプ後のpredicted_clean」に厳密に一致するはず。

@@ -70,6 +70,9 @@ def _parser():
     p.add_argument("--split", default="inference")
     p.add_argument("--num-samples", type=int, default=100)
     p.add_argument("--sampling-steps", type=int, default=50)
+    p.add_argument("--start-timestep", type=int,
+                   help="DDIMの最初のtimestep(省略時は拡散ステップ数−1=999)。"
+                        "epsilonではt=999でx0推定が悪条件になるため、手前から始めるときに指定する")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device")
     p.add_argument("--guide-mode", choices=("retrieved", "self_target"), default="retrieved",
@@ -192,7 +195,7 @@ def main(argv=None) -> int:
         from acceleration_forecasting_v2.inference.predict import predict
         result = predict(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split, device=args.device,
                          num_samples=args.num_samples, sampling_steps=args.sampling_steps, seed=args.seed,
-                         guide_mode=args.guide_mode)
+                         guide_mode=args.guide_mode, start_timestep=args.start_timestep)
     elif args.command == "evaluate":
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate
         result = evaluate(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split,

@@ -1,5 +1,8 @@
 """1レコード(12か月)あたりの評価指標。`acceleration_forecasting_12m/.../evaluation/metrics.py`を
-無変更で移植(正解のmask=0の月は全ての指標から除外される)。
+移植(正解のmask=0の月は全ての指標から除外される)。
+
+移植元からの追加: 符号付きの水準誤差`mean_error`(mean(予測中央値 − 正解))。
+MAEでは区別できない系統的な過大/過小予測を見るため(GENERATIVE_MODULE_NEXT_STEPS.md §0.3)。
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ def target_metrics(actual, mask, median, p10, p90):
         adjacent_difference_mae = np.nan
         direction_sign_agreement = np.nan
     return {
-        "MAE": float(np.mean(np.abs(error))), "MSE": float(np.mean(error**2)),
+        "MAE": float(np.mean(np.abs(error))), "mean_error": float(np.mean(error)), "MSE": float(np.mean(error**2)),
         "RMSE": float(np.sqrt(np.mean(error**2))), "correlation": correlation,
         "peak_value_error": float(abs(np.max(median[valid]) - np.max(actual[valid]))),
         "peak_month_error": int(abs(prediction_peak - actual_peak)),

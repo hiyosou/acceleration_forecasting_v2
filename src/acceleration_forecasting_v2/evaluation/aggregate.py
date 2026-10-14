@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 
 METRIC_NAMES = (
-    "MAE", "MSE", "RMSE", "correlation", "peak_value_error", "peak_month_error",
+    "MAE", "mean_error", "MSE", "RMSE", "correlation", "peak_value_error", "peak_month_error",
     "coverage_p10_p90", "mean_interval_width", "median_adjacent_abs_difference",
     "adjacent_difference_MAE", "direction_sign_agreement", "ensemble_mean_std",
 )

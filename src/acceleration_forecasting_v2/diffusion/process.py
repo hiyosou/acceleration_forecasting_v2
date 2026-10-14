@@ -97,12 +97,25 @@ class DiffusionProcess:
         return predicted_clean, epsilon
 
     @torch.inference_mode()
-    def ddim(self, batch, *, shape, sampling_steps=50, eta=0.0, normalized_clip=None, generator=None, initial_noise_scale=1.0):
+    def ddim(self, batch, *, shape, sampling_steps=50, eta=0.0, normalized_clip=None, generator=None, initial_noise_scale=1.0,
+             start_timestep=None):
+        """DDIMサンプリング。
+
+        start_timestep: 最初のステップのtimestep(Noneなら`steps - 1`=999で従来と同一)。
+            cosineスケジュールの終端はᾱ_999≈2.4e-9で、epsilon→x0の変換が誤差を約2万倍に
+            拡大する(x0がクリップ上限に張り付き、水準が過大になる)。これを避けるために
+            開始を手前にずらせるようにしている。GENERATIVE_MODULE_NEXT_STEPS.md §0.3参照。
+        """
         device = batch["history_values"].device
         values = float(initial_noise_scale) * torch.randn(shape, device=device, generator=generator)
         if int(sampling_steps) <= 0 or int(sampling_steps) > self.steps:
             raise ValueError("sampling_steps must be between 1 and diffusion steps")
-        sequence = np.linspace(self.steps - 1, 0, int(sampling_steps), dtype=int)
+        start = self.steps - 1 if start_timestep is None else int(start_timestep)
+        if start < 0 or start > self.steps - 1:
+            raise ValueError("start_timestep must be between 0 and diffusion steps - 1")
+        if int(sampling_steps) > start + 1:
+            raise ValueError("sampling_steps must not exceed start_timestep + 1")
+        sequence = np.linspace(start, 0, int(sampling_steps), dtype=int)
         for position, timestep in enumerate(sequence):
             next_timestep = sequence[position + 1] if position + 1 < len(sequence) else -1
             t = torch.full((shape[0],), int(timestep), device=device, dtype=torch.long)
