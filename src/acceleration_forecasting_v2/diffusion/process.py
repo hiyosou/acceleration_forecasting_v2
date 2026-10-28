@@ -130,7 +130,10 @@ class DiffusionProcess:
             output = self.model(values, t, batch)
             predicted_clean, epsilon = self.model_output_to_x0_epsilon(values, output, alpha)
             if normalized_clip is not None:
-                predicted_clean = predicted_clean.clamp(float(normalized_clip[0]), float(normalized_clip[1]))
+                # スカラー(absolute)か、要素ごとの上下限テンソル(残差方式、`inference/predict.py`)。
+                low, high = (bound.to(predicted_clean.dtype) if torch.is_tensor(bound) else float(bound)
+                             for bound in normalized_clip)
+                predicted_clean = predicted_clean.clamp(low, high)
             sigma = float(eta) * torch.sqrt((1 - next_alpha) / (1 - alpha) * (1 - alpha / next_alpha))
             direction = torch.sqrt(torch.clamp(1 - next_alpha - sigma.square(), min=0)) * epsilon
             random = torch.randn(values.shape, device=device, generator=generator) if next_timestep >= 0 else 0

@@ -20,6 +20,7 @@ from acceleration_forecasting_v2.evaluation.visualize import (
     months_since_maintenance,
     plot_prediction,
     plot_prediction_batch,
+    plot_prediction_pair,
     reconstruct_segment_maintenance_events,
     render_generation_histogram,
     render_measurement_history,
@@ -278,6 +279,15 @@ def test_render_generation_histogram_splits_evenly_across_two_bins_gives_equal_l
     widths = [patch.get_width() for patch in ax.patches]
     assert len(widths) == 2
     assert widths[0] == pytest.approx(widths[1])
+    plt.close(fig)
+
+
+def test_render_generation_histogram_legend_shows_the_actual_sample_count():
+    fig, ax = plt.subplots()
+    dates = pd.date_range("2023-01-01", periods=1, freq="MS")
+    render_generation_histogram(ax, dates, np.full((20, 1), 1.55), compute_fixed_bins(bin_width=0.1))
+    labels = [label for label in ax.get_legend_handles_labels()[1]]
+    assert labels == ["生成頻度(20回生成)"]
     plt.close(fig)
 
 
@@ -596,3 +606,24 @@ def test_plot_prediction_batch_raises_on_folder_name_collision(tmp_path):
             dataset_dir, artifact_dir, tmp_path / "batch_collide",
             methods={"method_a": str(prediction_dir)}, split="inference", count_per_category=2, seed=0,
         )
+
+
+# --- plot_prediction_pair(スモークテスト) -----------------------------------------------------
+
+def test_plot_prediction_pair_writes_a_diffusion_and_a_forgetting_png_per_record(tmp_path):
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+    # fixtureのanchorは同じdataset_idの2023-01-11/2023-07-20/2023-03-22。07-20は3点、01-11は1点で当てはめる
+    chosen = [str(metadata.iloc[1]["trend_id"]), str(metadata.iloc[0]["trend_id"])]
+    result = plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, tmp_path / "pair", trend_ids=chosen)
+    assert result["record_count"] == 2
+    assert [record["forgetting_input_points"] for record in result["records"]] == [3, 1]
+    for record in result["records"]:
+        for key in ("diffusion_output", "forgetting_output"):
+            path = Path(record[key])
+            assert path.is_file() and path.stat().st_size > 0
+
+
+def test_plot_prediction_pair_rejects_an_unknown_trend_id(tmp_path):
+    dataset_dir, artifact_dir, prediction_dir, _ = _write_visualize_fixture(tmp_path)
+    with pytest.raises(ValueError):
+        plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, tmp_path / "pair", trend_ids=["missing"])

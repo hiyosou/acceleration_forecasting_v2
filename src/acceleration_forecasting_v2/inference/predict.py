@@ -20,6 +20,7 @@ from acceleration_forecasting_v2.datasets.self_reference import build_self_targe
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.diffusion.process import DEFAULT_START_TIMESTEP, DiffusionProcess
 from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
+from acceleration_forecasting_v2.training.guide_mixing import from_residual, residual_clip_bounds
 
 
 def load_process(checkpoint_path, device, *, use_ema=True):
@@ -33,7 +34,8 @@ def load_process(checkpoint_path, device, *, use_ema=True):
     config = checkpoint["model_config"]
     state_dict = checkpoint["ema_state_dict" if use_ema else "model_state_dict"]
     context_residual_enabled = any("context_residual" in key for key in state_dict)
-    model = ReferenceModulatedUNetV2(config["dropout"], context_residual_enabled=context_residual_enabled).to(device)
+    model = ReferenceModulatedUNetV2(config["dropout"], context_residual_enabled=context_residual_enabled,
+                                     cycle_feature_dim=config.get("cycle_feature_dim", 0)).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     process = DiffusionProcess(model, config["diffusion_steps"], prediction_type=config["prediction_type"]).to(device)
@@ -85,6 +87,10 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
         raise ValueError("metadata.csv と配列のレコード数が一致しません。")
     current_values = metadata["current_acc_z_max"].to_numpy(dtype=np.float32) if include_targets else None
     normalized_clip = tuple(float(value) for value in dataset.target_norm.normalize(np.asarray(bounds, np.float32)))
+    # 残差方式(training/guide_mixing.py)のcheckpointは、DDIMの出力を残差として基準線に足し戻す。
+    # x0のクリップは「物理値に戻したときにboundsに収まる残差の範囲」を要素ごとに与える(absoluteの
+    # クリップと同じ意味。DDIM初期ステップでのx0推定の発散を抑える、GENERATIVE_MODULE_NEXT_STEPS.md §0.3)。
+    residual = config.get("residual_target") if config.get("target_mode", "absolute") == "residual" else None
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=0)
     generator = torch.Generator(device=device).manual_seed(int(seed))
 
@@ -95,13 +101,20 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
         if include_targets:
             positions = batch["index"].cpu().numpy()
             batch = build_self_target_batch(dataset, batch, current_values[positions])
+        expanded = _expand(batch, num_samples)
+        if residual is not None:
+            normalized_clip = residual_clip_bounds(expanded, residual, bounds, condition_norm=dataset.condition_norm)
         with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
             normalized = process.ddim(
-                _expand(batch, num_samples), shape=(size * num_samples, 12), sampling_steps=sampling_steps,
+                expanded, shape=(size * num_samples, 12), sampling_steps=sampling_steps,
                 eta=eta, normalized_clip=normalized_clip, generator=generator, initial_noise_scale=initial_noise_scale,
                 start_timestep=start_timestep,
             )
-        physical = dataset.physical_prediction(normalized.float().cpu().numpy(), bounds=bounds)
+        if residual is not None:
+            values = from_residual(normalized, expanded, residual, condition_norm=dataset.condition_norm)
+            physical = np.clip(values.cpu().numpy(), float(bounds[0]), float(bounds[1]))
+        else:
+            physical = dataset.physical_prediction(normalized.float().cpu().numpy(), bounds=bounds)
         all_samples.append(physical.reshape(size, num_samples, 12))
     samples = np.concatenate(all_samples, axis=0)
 
@@ -123,11 +136,11 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
                         samples=samples.astype(np.float32))
     summary = {
         "split": split, "record_count": int(len(samples)), "num_samples": int(num_samples),
-        "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed),
+        "sampling_steps": int(sampling_steps), "eta": float(eta), "seed": int(seed), "batch_size": int(batch_size),
         "start_timestep": int(min(DEFAULT_START_TIMESTEP, process.steps - 1) if start_timestep is None else start_timestep),
         "prediction_type": config["prediction_type"], "bounds": [float(bounds[0]), float(bounds[1])],
         "checkpoint": str(checkpoint_path), "use_ema": bool(use_ema), "mixed_precision": bool(use_autocast),
-        "guide_mode": guide_mode,
+        "guide_mode": guide_mode, "target_mode": config.get("target_mode", "absolute"),
     }
     (output_dir / "prediction_run.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

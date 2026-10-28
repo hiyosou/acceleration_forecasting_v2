@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .build import ARRAY_NAMES
+from .cycle_features import CYCLE_FEATURE_NAME, NORMALIZATION_FILE, normalize_cycle_features
 from .normalization import Normalization
 
 
@@ -31,8 +33,17 @@ class ForecastDatasetV2(Dataset):
         if include_targets:
             self.targets = np.load(self.path / "target_values.npy", mmap_mode="r")
             self.target_masks = np.load(self.path / "target_masks.npy", mmap_mode="r")
+            # 合成値(datasets.extension)で埋めた月の印。古いデータセットには無い(=全て実測)。
+            synthetic_path = self.path / "target_synthetic_masks.npy"
+            self.target_synthetic_masks = np.load(synthetic_path, mmap_mode="r") if synthetic_path.is_file() else None
         self.condition_norm = Normalization.load(self.root / "condition_normalization.json")
         self.target_norm = Normalization.load(self.root / "target_normalization.json")
+        # 忘却因子Dの要約(datasets.cycle_features、2026-10-27)。古いデータセットには無い。
+        features_path = self.path / f"{CYCLE_FEATURE_NAME}.npy"
+        self.cycle_features = None
+        if features_path.is_file():
+            self.cycle_features = np.load(features_path, mmap_mode="r")
+            self.cycle_feature_norm = json.loads((self.root / NORMALIZATION_FILE).read_text(encoding="utf-8"))
 
     def __len__(self):
         return len(self.arrays["history_values"])
@@ -56,10 +67,16 @@ class ForecastDatasetV2(Dataset):
             "segment_weight": torch.tensor(float(self.arrays["segment_weights"][index]), dtype=torch.float32),
             "index": torch.tensor(index, dtype=torch.long),
         }
+        if self.cycle_features is not None:
+            item["cycle_features"] = torch.from_numpy(self._finite_zero(
+                normalize_cycle_features(self.cycle_features[index], self.cycle_feature_norm)).copy())
         if self.include_targets:
             target = self._finite_zero(self.target_norm.normalize(self.targets[index]))
             item["target"] = torch.from_numpy(target.copy())
             item["target_mask"] = torch.from_numpy(self.target_masks[index].copy().astype(np.float32))
+            if self.target_synthetic_masks is not None:
+                item["target_synthetic_mask"] = torch.from_numpy(
+                    self.target_synthetic_masks[index].copy().astype(np.float32))
         return item
 
     def denormalize_target(self, values):

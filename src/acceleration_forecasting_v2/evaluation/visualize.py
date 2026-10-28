@@ -94,9 +94,12 @@ def load_segment_measurement_history(trend_catalog: pd.DataFrame, direction, bin
     return segment.merge(velocity, on="trend_id", how="left")
 
 
-def render_measurement_history(ax, measurement_history: pd.DataFrame, *, vmin=0.0, vmax=100.0):
+def render_measurement_history(ax, measurement_history: pd.DataFrame, *, vmin=0.0, vmax=100.0, alpha=None):
     """区間の全実測値を、走行速度で色分けした散布図として背景に描画する(旧リポジトリの
     `plot_target`の「全実測値」要素を再現)。速度が不明な点はグレーで描く。
+
+    alpha: 省略時は従来どおり(速度あり0.7・速度欠損0.6)。指定時は両方をその値にする
+    (`plot_prediction_pair`は不透明=1.0で描く、2026-10-22ユーザー指定)。
     """
     has_velocity = measurement_history["velocity"].notna()
     scatter = None
@@ -104,12 +107,13 @@ def render_measurement_history(ax, measurement_history: pd.DataFrame, *, vmin=0.
         subset = measurement_history.loc[has_velocity]
         scatter = ax.scatter(
             subset["measurement_date"], subset["current_acc_z_max"], c=subset["velocity"],
-            cmap="jet", vmin=vmin, vmax=vmax, s=24, alpha=0.7, label="全実測値", zorder=0,
+            cmap="jet", vmin=vmin, vmax=vmax, s=24, alpha=0.7 if alpha is None else alpha,
+            label="全実測値", zorder=0,
         )
     if (~has_velocity).any():
         subset = measurement_history.loc[~has_velocity]
         ax.scatter(subset["measurement_date"], subset["current_acc_z_max"], color="0.55", s=24,
-                  alpha=0.6, label="全実測値(速度欠損)", zorder=0)
+                  alpha=0.6 if alpha is None else alpha, label="全実測値(速度欠損)", zorder=0)
     return scatter
 
 
@@ -243,7 +247,7 @@ def render_generation_histogram(ax, dates, samples, bin_edges, *, color="tab:ora
             ax.barh(
                 y=bin_centers[bin_index], width=half_width * 2, left=date_num - half_width,
                 height=bin_width * 0.9, color=color, align="center", linewidth=0,
-                label="生成頻度(100回生成)" if first else "_nolegend_", zorder=2,
+                label=f"生成頻度({samples.shape[0]}回生成)" if first else "_nolegend_", zorder=2,
             )
             first = False
 
@@ -258,17 +262,87 @@ def render_quartile_band(ax, dates, samples, *, color="tab:orange"):
     ax.plot(dates, q3, color=color, linestyle=":", linewidth=1.2, label="第3四分位数", zorder=3)
 
 
+def _new_record_figure(measurement_history, *, measurement_alpha=None):
+    """1レコード分の図の土台(透明背景・全実測値の散布図・走行速度のカラーバー)を作る。"""
+    plt.rcParams["font.family"] = "MS Gothic"
+    fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
+    fig.patch.set_alpha(0.0)
+    ax.set_facecolor("none")
+    if measurement_history is not None and not measurement_history.empty:
+        scatter = render_measurement_history(ax, measurement_history, alpha=measurement_alpha)
+        if scatter is not None:
+            colorbar = fig.colorbar(scatter, ax=ax, pad=0.01)
+            colorbar.set_label("走行速度 [km/h]")
+    return fig, ax
+
+
+def _finish_record_figure(fig, ax, output_path, *, title, anchor, forecast_start, maintenance_events,
+                          plot_start, plot_end, y_bounds, dpi):
+    """施工線(+種別の文字)・予測起点・予測開始・軸・凡例を描き、透明背景のPNGで保存する。"""
+    first_maintenance = True
+    for event in maintenance_events:
+        date = event["date"]
+        if date < plot_start or date > plot_end:
+            continue
+        ax.axvline(date, color="0.35", linestyle="--", linewidth=1.0,
+                   label="施工(メンテナンス)" if first_maintenance else "_nolegend_", zorder=1)
+        first_maintenance = False
+        label_parts = [str(value) for value in (event.get("maintenance_type"), event.get("maintenance_description"))
+                       if value is not None and str(value) != "nan"]
+        if label_parts:
+            ax.text(date, y_bounds[1] * 0.98, "\n".join(label_parts), rotation=90, fontsize=7,
+                    va="top", ha="right", color="0.3")
+
+    ax.axvline(anchor, color="steelblue", linestyle="-", linewidth=1.0, label="予測起点")
+    ax.axvline(forecast_start, color="navy", linestyle=":", linewidth=1.3, label="予測開始")
+
+    ax.set_ylim(*y_bounds)
+    ax.set_ylabel("絶対値最大加速度 [m/s²]")
+    ax.set_title(title)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
+    fig.autofmt_xdate(rotation=45)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=dpi, transparent=True, bbox_inches="tight")
+    plt.close(fig)
+
+
+DIRECTION_LABELS = {"U": "上り", "D": "下り"}
+
+
+def _record_title(direction, bin_start_m, bin_end_m, anchor, trend_id, suffix=None, forecast_start=None):
+    """図のタイトル。従来の書式(`plot_prediction`)と、`forecast_start`指定時の書式
+    (上り/下り・位置・予測起点・予測開始を1行目、trend_idを2行目。2026-10-22ユーザー指定)。"""
+    if forecast_start is None:
+        title = f"{direction}方向 {bin_start_m:.0f}-{bin_end_m:.0f}m / 起点 {anchor.date()} / {trend_id}"
+        return f"{title} / {suffix}" if suffix else title
+    label = DIRECTION_LABELS.get(str(direction), f"{direction}方向")
+    first_line = (f"{label} {bin_start_m:.0f}-{bin_end_m:.0f}m / 予測起点 {anchor.date()} / "
+                  f"予測開始 {pd.Timestamp(forecast_start):%Y-%m}")
+    if suffix:
+        first_line = f"{first_line} / {suffix}"
+    return f"{first_line}\n{trend_id}"
+
+
 def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_start_m, bin_end_m,
                             anchor_date, current_value, history_dates, history_values, history_masks,
                             forecast_dates, guide_values, guide_masks, target_values, target_masks,
                             samples, maintenance_events, bin_width=0.1,
-                            y_bounds=(PHYSICAL_MIN, PHYSICAL_MAX), dpi=150, measurement_history=None):
+                            y_bounds=(PHYSICAL_MIN, PHYSICAL_MAX), dpi=150, measurement_history=None,
+                            show_target=True, measurement_alpha=None, title_suffix=None, maintenance_from=None):
     """1枚のmatplotlib図を組み立てて保存する。
 
     measurement_history: `load_segment_measurement_history`が返す形のDataFrame(省略時は
     描画しない)。区間の全実測値(走行速度で色分け)を背景に重ねる。
+
+    2026-10-22追加(`plot_prediction_pair`用、既定値では従来と同じ図になる):
+    show_target=Falseで正解値の線を描かない。measurement_alphaで全実測値の透明度を指定する。
+    title_suffixはタイトル末尾に付ける手法名。maintenance_fromは施工線を描き始める日付
+    (既定は履歴の最初の月)。
     """
-    plt.rcParams["font.family"] = "MS Gothic"
     history_dates = pd.DatetimeIndex(history_dates)
     forecast_dates = pd.DatetimeIndex(forecast_dates)
     anchor = pd.Timestamp(anchor_date)
@@ -277,15 +351,7 @@ def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_
     target_values = np.asarray(target_values, dtype=np.float64)
     guide_values = np.asarray(guide_values, dtype=np.float64)
 
-    fig, ax = plt.subplots(figsize=(12, 7), constrained_layout=True)
-    fig.patch.set_alpha(0.0)
-    ax.set_facecolor("none")
-
-    if measurement_history is not None and not measurement_history.empty:
-        scatter = render_measurement_history(ax, measurement_history)
-        if scatter is not None:
-            colorbar = fig.colorbar(scatter, ax=ax, pad=0.01)
-            colorbar.set_label("走行速度 [km/h]")
+    fig, ax = _new_record_figure(measurement_history, measurement_alpha=measurement_alpha)
 
     history_valid = np.asarray(history_masks) > 0
     ax.plot(history_dates[history_valid], history_values[history_valid], "o-", color="tab:blue",
@@ -303,40 +369,56 @@ def plot_prediction_record(output_path, *, trend_id, dataset_id, direction, bin_
     render_generation_histogram(ax, forecast_dates, samples, bin_edges)
     render_quartile_band(ax, forecast_dates, samples)
 
-    target_valid = np.asarray(target_masks) > 0
-    ax.plot(forecast_dates[target_valid], target_values[target_valid], "D-", color="tab:green",
-            label="正解値", zorder=4)
+    if show_target:
+        target_valid = np.asarray(target_masks) > 0
+        ax.plot(forecast_dates[target_valid], target_values[target_valid], "D-", color="tab:green",
+                label="正解値", zorder=4)
 
-    plot_start, plot_end = history_dates.min(), forecast_dates.max()
-    first_maintenance = True
-    for event in maintenance_events:
-        date = event["date"]
-        if date < plot_start or date > plot_end:
-            continue
-        ax.axvline(date, color="0.35", linestyle="--", linewidth=1.0,
-                   label="施工(メンテナンス)" if first_maintenance else "_nolegend_", zorder=1)
-        first_maintenance = False
-        label_parts = [str(value) for value in (event.get("maintenance_type"), event.get("maintenance_description"))
-                       if value is not None and str(value) != "nan"]
-        if label_parts:
-            ax.text(date, y_bounds[1] * 0.98, "\n".join(label_parts), rotation=90, fontsize=7,
-                    va="top", ha="right", color="0.3")
+    plot_start = history_dates.min() if maintenance_from is None else pd.Timestamp(maintenance_from)
+    _finish_record_figure(
+        fig, ax, output_path,
+        title=_record_title(direction, bin_start_m, bin_end_m, anchor, trend_id, title_suffix,
+                            forecast_start=forecast_dates[0] if title_suffix else None),
+        anchor=anchor, forecast_start=forecast_dates[0], maintenance_events=maintenance_events,
+        plot_start=plot_start, plot_end=forecast_dates.max(), y_bounds=y_bounds, dpi=dpi,
+    )
 
-    ax.axvline(anchor, color="steelblue", linestyle="-", linewidth=1.0, label="予測起点")
-    ax.axvline(forecast_dates[0], color="navy", linestyle=":", linewidth=1.3, label="予測開始")
 
-    ax.set_ylim(*y_bounds)
-    ax.set_ylabel("絶対値最大加速度 [m/s²]")
-    ax.set_title(f"{direction}方向 {bin_start_m:.0f}-{bin_end_m:.0f}m / 起点 {anchor.date()} / {trend_id}")
-    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8)
-    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%y/%m"))
-    fig.autofmt_xdate(rotation=45)
+def plot_forgetting_factor_record(output_path, *, trend_id, direction, bin_start_m, bin_end_m, anchor_date,
+                                  current_value, input_dates, input_values, forecast_dates, lambdas,
+                                  maintenance_events, measurement_history=None, maintenance_from=None,
+                                  y_bounds=(PHYSICAL_MIN, PHYSICAL_MAX), dpi=150, measurement_alpha=1.0,
+                                  color="tab:purple"):
+    """忘却因子付き線形近似(`evaluation/forgetting_factor.py`)の図を、拡散モデルの図と同じ書式で保存する。
 
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi, transparent=True, bbox_inches="tight")
-    plt.close(fig)
+    入力に使った全計測を紫の丸で囲み、λごとの直線の最小〜最大を入力期間の最初から予測期間の
+    終わりまで薄い色で塗り、λの最大値(既定1.00)の直線を細線で重ねる。正解値の線は描かない。
+    """
+    from acceleration_forecasting_v2.evaluation.forgetting_factor import forgetting_factor_lines
+
+    input_dates, forecast_dates = pd.DatetimeIndex(input_dates), pd.DatetimeIndex(forecast_dates)
+    anchor = pd.Timestamp(anchor_date)
+    grid = pd.date_range(input_dates.min(), forecast_dates.max() + pd.Timedelta(days=15), freq="D")
+    lines = forgetting_factor_lines(input_dates, input_values, grid, lambdas)
+    order = np.argsort(lambdas)[::-1]
+
+    fig, ax = _new_record_figure(measurement_history, measurement_alpha=measurement_alpha)
+    ax.scatter(input_dates, input_values, s=46, facecolors="none", edgecolors=color, linewidths=1.0, zorder=3,
+               label="忘却因子の入力(全計測)")
+    ax.plot([anchor], [current_value], "*", color=color, markersize=14, zorder=5)
+    ax.fill_between(grid, lines.min(axis=0), lines.max(axis=0), color=color, alpha=0.18, linewidth=0, zorder=1,
+                    label=f"忘却因子 λ={max(lambdas):.2f}〜{min(lambdas):.2f} の範囲")
+    ax.plot(grid, lines[order[0]], color=color, linewidth=0.8, alpha=0.8, zorder=2,
+            label=f"忘却因子 λ={max(lambdas):.2f}")
+
+    plot_start = input_dates.min() if maintenance_from is None else pd.Timestamp(maintenance_from)
+    _finish_record_figure(
+        fig, ax, output_path,
+        title=_record_title(direction, bin_start_m, bin_end_m, anchor, trend_id, "忘却因子",
+                            forecast_start=forecast_dates[0]),
+        anchor=anchor, forecast_start=forecast_dates[0], maintenance_events=maintenance_events,
+        plot_start=plot_start, plot_end=forecast_dates.max(), y_bounds=y_bounds, dpi=dpi,
+    )
 
 
 def _load_samples_for_trend_id(prediction_dir, trend_id):
@@ -642,3 +724,98 @@ def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, 
         "pool_sizes": selection["pool_sizes"], "records": records,
         "manifest_path": str(manifest_path) if manifest_path is not None else None,
     }
+
+
+def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, *, trend_ids, split="inference",
+                         model_label="拡散モデル", lambdas=None, bin_width=0.1, dpi=150) -> dict:
+    """指定レコードごとに、拡散モデルの予測図と忘却因子付き線形近似の図を別々に書き出す(2026-10-22)。
+
+    ユーザーとの取り決め: 拡散モデルの推論結果を示すときは、同じレコードの忘却因子の予測も
+    別の図で並べる。どちらの図も`plot_prediction`と同じ書式(透明背景・施工線・予測起点/開始)で、
+    正解値の線は描かず、全実測値は不透明に描く。履歴(説明系列)は実際の計測日に描く
+    (`plot_prediction`は月初の位置)。
+
+    出力: 推論対象(レコード)ごとにフォルダを分け、`output_dir/{direction}_{bin_start}-{bin_end}m_{anchor}/`の
+    中に`diffusion.png`と`forgetting.png`を置く(2026-10-22ユーザー指定)。タイトルには上り/下り・位置・
+    予測起点・予測開始を入れる。同じ区間・同じ起点日で別dataset_idのレコードが重なった場合は例外を出す。
+    """
+    from acceleration_forecasting_v2.datasets.history import build_history_window
+    from acceleration_forecasting_v2.evaluation.forgetting_factor import DEFAULT_LAMBDAS, cycle_measurements
+
+    lambdas = tuple(DEFAULT_LAMBDAS if lambdas is None else lambdas)
+    dataset_dir, artifact_dir, output_dir = Path(dataset_dir), Path(artifact_dir), Path(output_dir)
+    split_dir = dataset_dir / split
+    metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
+    lookup = {str(value): index for index, value in enumerate(metadata["trend_id"])}
+    guide_values = np.load(split_dir / "guide_values.npy")
+    guide_masks = np.load(split_dir / "guide_masks.npy")
+    target_values = np.load(split_dir / "target_values.npy")
+    target_masks = np.load(split_dir / "target_masks.npy")
+    trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+    velocity_manifest = _load_velocity_manifest(artifact_dir)
+    events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
+
+    records, folders_seen = [], {}
+    for trend_id in trend_ids:
+        trend_id = str(trend_id)
+        if trend_id not in lookup:
+            raise ValueError(f"trend_id={trend_id!r} がmetadata.csvに存在しません。")
+        index = lookup[trend_id]
+        row = metadata.iloc[index]
+        anchor = pd.Timestamp(row["anchor_date"]).normalize()
+        direction, bin_start_m, bin_end_m = row["direction"], float(row["bin_start_m"]), float(row["bin_end_m"])
+        current_value = float(row["current_acc_z_max"])
+
+        cycle = cycle_measurements(trend_catalog, row["dataset_id"], anchor)
+        section = cycle.rename(columns={"value": "acc_z_max"})
+        history_values, history_masks, history_dates = build_history_window(section, anchor, months=6)
+        history_dates = pd.to_datetime([date if date else pd.NaT for date in history_dates])
+
+        catalog_row = trend_catalog.loc[trend_catalog["trend_id"].astype(str) == trend_id]
+        if catalog_row.empty:
+            raise ValueError(f"trend_id={trend_id!r} がtrend_catalog.csvに見つかりません。")
+        selected_dates = json.loads(catalog_row.iloc[0]["selected_dates"])
+        first_month = anchor.replace(day=1) + pd.DateOffset(months=1)
+        forecast_dates = pd.DatetimeIndex([
+            pd.Timestamp(date) if date else first_month + pd.DateOffset(months=offset)
+            for offset, date in enumerate(selected_dates)
+        ])
+
+        measurement_history = load_segment_measurement_history(
+            trend_catalog, direction, bin_start_m, velocity_manifest=velocity_manifest)
+        maintenance_events = events_by_segment.get((direction, bin_start_m, bin_end_m), [])
+        maintenance_from = measurement_history["measurement_date"].min()
+        folder = f"{direction}_{bin_start_m:.0f}-{bin_end_m:.0f}m_{anchor.date()}"
+        if folder in folders_seen and folders_seen[folder] != trend_id:
+            raise ValueError(f"フォルダ名{folder!r}がtrend_id={trend_id!r}と{folders_seen[folder]!r}の間で衝突しました。")
+        folders_seen[folder] = trend_id
+        samples = _load_samples_for_trend_id(prediction_dir, trend_id)
+
+        diffusion_path = output_dir / folder / "diffusion.png"
+        plot_prediction_record(
+            diffusion_path, trend_id=trend_id, dataset_id=row["dataset_id"], direction=direction,
+            bin_start_m=bin_start_m, bin_end_m=bin_end_m, anchor_date=anchor, current_value=current_value,
+            history_dates=history_dates, history_values=history_values, history_masks=history_masks,
+            forecast_dates=forecast_dates, guide_values=guide_values[index], guide_masks=guide_masks[index],
+            target_values=target_values[index], target_masks=target_masks[index], samples=samples,
+            maintenance_events=maintenance_events, bin_width=bin_width, dpi=dpi,
+            measurement_history=measurement_history, show_target=False, measurement_alpha=1.0,
+            title_suffix=model_label, maintenance_from=maintenance_from,
+        )
+        forgetting_path = output_dir / folder / "forgetting.png"
+        plot_forgetting_factor_record(
+            forgetting_path, trend_id=trend_id, direction=direction, bin_start_m=bin_start_m, bin_end_m=bin_end_m,
+            anchor_date=anchor, current_value=current_value, input_dates=cycle["measurement_date"],
+            input_values=cycle["value"].to_numpy(float), forecast_dates=forecast_dates, lambdas=lambdas,
+            maintenance_events=maintenance_events, measurement_history=measurement_history,
+            maintenance_from=maintenance_from, dpi=dpi,
+        )
+        records.append({
+            "trend_id": trend_id, "dataset_id": str(row["dataset_id"]), "folder": folder,
+            "direction": direction, "bin_start_m": bin_start_m, "bin_end_m": bin_end_m,
+            "anchor_date": str(anchor.date()), "forecast_start": str(forecast_dates[0].date()),
+            "num_samples": int(samples.shape[0]), "forgetting_input_points": int(len(cycle)),
+            "diffusion_output": str(diffusion_path), "forgetting_output": str(forgetting_path),
+        })
+    return {"split": split, "model_label": model_label, "lambdas": list(lambdas), "record_count": len(records),
+            "records": records}

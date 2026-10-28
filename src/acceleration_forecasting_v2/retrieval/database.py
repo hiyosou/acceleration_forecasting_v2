@@ -151,3 +151,25 @@ def store_metadata(connection, values):
             for key, value in values.items()
         ],
     )
+
+
+EXTENSION_COLUMNS = {"future_synthetic_mask": "TEXT", "extension_lambda": "REAL", "extension_seed": "INTEGER"}
+
+
+def update_trend_futures(connection, trend_frame):
+    """`trends`の将来値(future_values/future_mask/selected_dates)を合成値入りのものに置き換える
+    (`datasets.extension`、2026-10-22)。合成の印・λ・seedの列が無ければ追加する。
+
+    `trend_frame`は列 trend_id・future_values・future_mask・selected_dates・future_synthetic_mask・
+    extension_lambda・extension_seed・guide_available_date を持つ。DBに無いtrend_idの行は無視する。
+    """
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(trends)")}
+    for column, kind in EXTENSION_COLUMNS.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE trends ADD COLUMN {column} {kind}")
+    columns = ["future_values", "future_mask", "selected_dates", "guide_available_date", *EXTENSION_COLUMNS]
+    connection.executemany(
+        f"UPDATE trends SET {', '.join(f'{column}=?' for column in columns)} WHERE trend_id=?",
+        [tuple(None if pd.isna(row[column]) else row[column] for column in columns) + (row["trend_id"],)
+         for _, row in trend_frame.iterrows()],
+    )

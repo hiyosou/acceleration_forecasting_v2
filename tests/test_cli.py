@@ -144,6 +144,21 @@ def test_cli_plot_prediction_accepts_min_target_range(tmp_path, capsys):
     assert Path(result["output_path"]).is_file()
 
 
+def test_cli_plot_prediction_pair_runs_against_a_fabricated_fixture(tmp_path, capsys):
+    from test_visualize import _write_visualize_fixture
+
+    dataset_dir, artifact_dir, prediction_dir, metadata = _write_visualize_fixture(tmp_path)
+    chosen = str(metadata.iloc[1]["trend_id"])
+
+    code, result = _run(capsys, "plot-prediction-pair", "--dataset-dir", dataset_dir, "--split", "inference",
+                        "--prediction-dir", prediction_dir, "--artifact-dir", artifact_dir,
+                        "--output-dir", tmp_path / "pair", "--trend-id", chosen, "--lambdas", 1.0, 0.95, 0.9)
+    assert code == 0
+    assert result["lambdas"] == [1.0, 0.95, 0.9]
+    record = result["records"][0]
+    assert Path(record["diffusion_output"]).is_file() and Path(record["forgetting_output"]).is_file()
+
+
 def test_cli_plot_prediction_batch_runs_against_fabricated_fixtures(tmp_path, capsys):
     from test_visualize import _write_extra_prediction_dir, _write_visualize_fixture
 
@@ -175,3 +190,41 @@ def test_cli_build_self_reference_dataset_runs(tmp_path, capsys):
     assert code == 0
     assert set(result["counts"]) == {"model_train", "model_validation", "inference"}
     assert (tmp_path / "dataset_self_reference" / "model_validation" / "guide_values.npy").is_file()
+
+
+def test_cli_extend_trends_prepare_verify_and_forgetting_factor_run(tmp_path, capsys):
+    from test_extension import _write_raw_trend_dir
+
+    artifacts, trend_dir, extended = tmp_path / "artifacts", tmp_path / "trends", tmp_path / "extended"
+    build_artifacts(artifacts, n_datasets=12, months=22, seed=0)
+    _write_raw_trend_dir(trend_dir, 12, 22)
+    code, result = _run(capsys, "extend-trends", "--artifact-dir", artifacts, "--output-dir", extended,
+                        "--trend-dir", trend_dir)
+    assert code == 0 and result["database"]["rows_with_synthetic"] > 0
+
+    dataset = tmp_path / "dataset"
+    code, result = _run(capsys, "prepare", "--artifact-dir", artifacts, "--output-dir", dataset, "--device", "cpu",
+                        "--inference-max-per-segment", 10,
+                        "--trend-catalog-path", extended / "trend_catalog.csv",
+                        "--database-path", extended / "vector_database.sqlite",
+                        "--extend-splits", "model_train", "model_validation",
+                        "--min-months-after-maintenance", 5,
+                        "--maintenance-rule-splits", "model_train", "model_validation")
+    assert code == 0 and result["splits"]["model_train"]["synthetic_target_months"] > 0
+    assert result["splits"]["inference"]["synthetic_target_months"] == 0
+
+    code, result = _run(capsys, "verify", "--dataset-dir", dataset, "--artifact-dir", artifacts,
+                        "--no-synthetic-split", "inference", "--min-months-after-maintenance", 5,
+                        "--maintenance-rule-split", "model_train", "--maintenance-rule-split", "model_validation")
+    assert code == 0 and result["violation_count"] == 0
+
+    prediction = tmp_path / "ff"
+    code, result = _run(capsys, "predict-forgetting-factor", "--dataset-dir", dataset,
+                        "--trend-catalog-path", artifacts / "trend_catalog.csv", "--output-dir", prediction,
+                        "--lambdas", 1.0, 0.95, 0.9)
+    assert code == 0 and result["lambdas"] == [1.0, 0.95, 0.9]
+
+    code, result = _run(capsys, "evaluate", "--dataset-dir", dataset, "--prediction-dir", prediction,
+                        "--output-dir", tmp_path / "eval", "--bootstrap", 10, "--month-filter", "real",
+                        "--min-target-months", 1)
+    assert code == 0 and result["config"]["month_filter"] == "real"

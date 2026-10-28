@@ -256,8 +256,12 @@ class ReferenceModulatedUNetV2(nn.Module):
         # 現行の本番アーキテクチャと同一)。`inference/predict.py::load_process`が
         # checkpointのstate_dictから自動判定して渡す。PROGRESS.md参照。
         context_residual_enabled: bool = True,
+        # 2026-10-27追加: 条件入力に足すサイクルの忘却因子Dの要約の次元(`datasets.cycle_features`)。
+        # 0なら従来と同じモデル。
+        cycle_feature_dim: int = 0,
     ):
         super().__init__()
+        self.cycle_feature_dim = int(cycle_feature_dim)
         self.history_months = int(history_months)
         self.forecast_months = int(forecast_months)
         self.reference_similarity_enabled = bool(reference_similarity_enabled)
@@ -284,7 +288,7 @@ class ReferenceModulatedUNetV2(nn.Module):
         condition_half = self.condition_dim // 2
         # SPEC 1.1: history_values(history_months) + history_masks(history_months)
         self.condition_encoder = nn.Sequential(
-            nn.Linear(2 * self.history_months, condition_half), nn.SiLU(), nn.Linear(condition_half, condition_half)
+            nn.Linear(2 * self.history_months + self.cycle_feature_dim, condition_half), nn.SiLU(), nn.Linear(condition_half, condition_half)
         )
         self.time_encoder = TimeEmbedding(condition_half)
         self.reference_encoder = GuideEncoder12(
@@ -349,7 +353,12 @@ class ReferenceModulatedUNetV2(nn.Module):
         Returns:
             shape (batch, forecast_months)。
         """
-        condition_input = torch.cat([batch["history_values"], batch["history_masks"]], dim=-1)
+        parts = [batch["history_values"], batch["history_masks"]]
+        if self.cycle_feature_dim:
+            if "cycle_features" not in batch:
+                raise KeyError("cycle_feature_dim > 0 のモデルには batch['cycle_features'] が必要です。")
+            parts.append(batch["cycle_features"])
+        condition_input = torch.cat(parts, dim=-1)
         condition = torch.cat([self.condition_encoder(condition_input), self.time_encoder(timesteps)], dim=-1)
         references = self.reference_encoder(batch["guide_values"], batch["guide_deltas"], batch["guide_similarities"])
         reference_mask = batch["guide_mask"] * batch["retrieval_mask"].unsqueeze(-1)

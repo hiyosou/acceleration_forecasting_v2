@@ -28,7 +28,8 @@ from acceleration_forecasting_v2.retrieval.database import connect_read_only
 from acceleration_forecasting_v2.retrieval.pipeline import encode_waveforms
 from acceleration_forecasting_v2.retrieval.search import GuideIndex, SearchConfig
 from .anchors import compute_segment_weights, select_anchors_for_segment
-from .build import build_raw_split, write_dataset
+from .build import build_raw_split, write_dataset, write_split
+from .extension import strip_synthetic
 
 SPLITS = ("model_train", "model_validation", "inference")
 GUIDE_SOURCE_SPLITS = {
@@ -75,7 +76,9 @@ def thin_evenly(anchors, limit):
 def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_months=MIN_HISTORY_MONTHS,
                      min_target_months=MIN_TARGET_MONTHS, min_guide_months=MIN_GUIDE_MONTHS,
                      temperature=0.1, max_current_difference=0.5, max_datasets_per_split=None,
-                     inference_max_per_segment=None) -> dict:
+                     inference_max_per_segment=None, trend_catalog_path=None, database_path=None,
+                     extend_splits=None, min_months_after_maintenance=None, maintenance_rule_splits=(),
+                     splits=SPLITS, normalization_dir=None) -> dict:
     """`build_retrieval_database`の出力ディレクトリから学習用データセットを構築する。
 
     Args:
@@ -84,25 +87,44 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
             正解が`min_target_months`か月以上ある(=評価に使える)anchorだけを残し、セグメントごとに
             日付が均等になるよう最大N件へ間引く。推論(DDIM)の計算量を抑えるためで、trainとvalidationには影響しない。
             未指定なら従来どおり、推論時点で利用可能なanchorを全て含める(production_ready基準)。
+        trend_catalog_path / database_path: 既定は`artifact_dir`内のもの。忘却因子で延長した成果物
+            (`datasets.extension.build_extended_artifacts`)を使うときに指定する。waveforms.bin・
+            autoencoder.pt・split_manifest.csvは常に`artifact_dir`から読む。
+        extend_splits: trend_catalogに合成値(`future_synthetic_mask`)があるとき、合成値を正解に使う
+            split。ここに無いsplitは合成の月を元の欠測に戻す。Noneならcatalogのまま使う。
+        min_months_after_maintenance / maintenance_rule_splits: 指定したsplitだけ、起点の月が
+            サイクル起点(補修)の月からこの月数以上の起点に限る(trend_catalogの`cycle_start`列が必要)。
+        splits / normalization_dir: model_trainを含めずに一部のsplitだけ作るとき、正規化統計は
+            `normalization_dir`の2ファイルをそのままコピーする(同じ学習データで、評価用のinferenceだけを
+            別の条件で作り直す用途、2026-10-22)。
     """
     artifact_dir, output_dir = Path(artifact_dir), Path(output_dir)
     manifest = pd.read_csv(artifact_dir / "split_manifest.csv", encoding="utf-8-sig")
     if "model_split" not in manifest.columns:
         raise ValueError("split_manifest.csvにmodel_split列がありません(先にretrievalの構築を実行してください)。")
-    trends = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
+    trend_catalog_path = Path(trend_catalog_path) if trend_catalog_path else artifact_dir / "trend_catalog.csv"
+    trends = pd.read_csv(trend_catalog_path, encoding="utf-8-sig")
     unique_datasets = manifest.drop_duplicates("dataset_id")
     split_of_dataset = pd.Series(unique_datasets["model_split"].to_numpy(), index=unique_datasets["dataset_id"].astype(str))
     trends["dataset_id"] = trends["dataset_id"].astype(str)
     trends["model_split"] = trends["dataset_id"].map(split_of_dataset)
     trends = trends.dropna(subset=["model_split"])
+    if extend_splits is not None:
+        trends = strip_synthetic(trends, trends["model_split"].isin(set(extend_splits)))
+    maintenance_rule_splits = set(maintenance_rule_splits or ())
+    if maintenance_rule_splits and min_months_after_maintenance is None:
+        raise ValueError("maintenance_rule_splitsを指定するときはmin_months_after_maintenanceも指定してください。")
 
-    database_path = artifact_dir / "vector_database.sqlite"
+    database_path = Path(database_path) if database_path else artifact_dir / "vector_database.sqlite"
     guide_index = GuideIndex(sqlite3.connect(f"file:{database_path.resolve().as_posix()}?mode=ro", uri=True))
     development_vectors = _development_query_vectors(database_path)
     search_config = SearchConfig(min_valid_months=int(min_guide_months), max_current_difference=max_current_difference)
 
+    splits = tuple(split for split in SPLITS if split in set(splits))
+    if "model_train" not in splits and normalization_dir is None:
+        raise ValueError("model_trainを作らないときはnormalization_dirを指定してください。")
     anchors_by_split = {}
-    for split in SPLITS:
+    for split in splits:
         split_trends = trends.loc[trends["model_split"] == split]
         dataset_ids = sorted(split_trends["dataset_id"].unique())
         if max_datasets_per_split is not None:
@@ -113,6 +135,8 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
                 split_trends.loc[split_trends["dataset_id"] == dataset_id], split=split,
                 min_history_months=min_history_months, min_target_months=min_target_months,
                 history_months=HISTORY_MONTHS, forecast_months=FORECAST_MONTHS,
+                min_months_after_maintenance=(min_months_after_maintenance if split in maintenance_rule_splits
+                                              else None),
             )
             if split == "inference" and inference_max_per_segment is not None:
                 segment_anchors = thin_evenly(
@@ -122,14 +146,14 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
             anchors.extend(segment_anchors)
         anchors_by_split[split] = anchors
 
-    inference_ids = {anchor.trend_id for anchor in anchors_by_split["inference"]}
+    inference_ids = {anchor.trend_id for anchor in anchors_by_split.get("inference", [])}
     query_vectors = {
         "model_train": development_vectors, "model_validation": development_vectors,
         "inference": _inference_query_vectors(artifact_dir, manifest, inference_ids, device),
     }
 
     raw_splits = {}
-    for split in SPLITS:
+    for split in splits:
         anchors = anchors_by_split[split]
         if not anchors:
             if split == "inference":
@@ -140,15 +164,30 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
             allowed_guide_splits=GUIDE_SOURCE_SPLITS[split], segment_weights=compute_segment_weights(anchors),
             search_config=search_config, temperature=temperature,
         )
-    write_dataset(raw_splits, output_dir)
+    if "model_train" in raw_splits:
+        write_dataset(raw_splits, output_dir)
+    else:
+        import shutil
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("condition_normalization.json", "target_normalization.json"):
+            shutil.copy2(Path(normalization_dir) / name, output_dir / name)
+        for split, raw in raw_splits.items():
+            write_split(raw, output_dir / split)
 
     summary = {
         "config": {"min_history_months": int(min_history_months), "min_target_months": int(min_target_months),
                    "min_guide_months": int(min_guide_months), "temperature": float(temperature),
                    "max_current_difference": max_current_difference, "max_datasets_per_split": max_datasets_per_split,
-                   "inference_max_per_segment": inference_max_per_segment},
+                   "inference_max_per_segment": inference_max_per_segment,
+                   "trend_catalog_path": str(trend_catalog_path), "database_path": str(database_path),
+                   "extend_splits": sorted(extend_splits) if extend_splits is not None else None,
+                   "min_months_after_maintenance": min_months_after_maintenance,
+                   "maintenance_rule_splits": sorted(maintenance_rule_splits), "splits": list(splits),
+                   "normalization_dir": str(normalization_dir) if normalization_dir else None},
         "splits": {split: {"anchors": int(len(raw.metadata)), "datasets": int(raw.metadata["dataset_id"].nunique()),
-                           "anchors_with_guides": int((raw.metadata["guide_count"] > 0).sum())}
+                           "anchors_with_guides": int((raw.metadata["guide_count"] > 0).sum()),
+                           "synthetic_target_months": int(raw.metadata["synthetic_future_months"].sum())}
                    for split, raw in raw_splits.items()},
     }
     (output_dir / "prepare_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

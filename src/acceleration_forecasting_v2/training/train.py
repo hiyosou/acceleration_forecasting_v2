@@ -27,9 +27,13 @@ from torch.utils.data import DataLoader
 from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.diffusion.process import DiffusionProcess
+from acceleration_forecasting_v2.datasets.cycle_features import FEATURE_DIM, NORMALIZATION_FILE
 from acceleration_forecasting_v2.models.reference_modulated_unet import ReferenceModulatedUNetV2
 from .ema import EMA
+from .guide_mixing import fit_residual_target, mix_guide_batch, sample_lambdas, to_residual
 from .loss import SegmentWeightedMaskedLoss
+
+TARGET_MODES = ("absolute", "residual")
 
 
 def _device(value):
@@ -58,21 +62,35 @@ def dataset_build_id(dataset_dir) -> str:
         digest.update((dataset_dir / name).read_bytes())
     for split in ("model_train", "model_validation"):
         digest.update(str(len(ForecastDatasetV2(dataset_dir / split, dataset_dir))).encode())
+    # サイクル特徴(datasets.cycle_features)があるデータセットだけ、その統計をIDに含める(無いものは従来のID)。
+    if (dataset_dir / NORMALIZATION_FILE).is_file():
+        digest.update((dataset_dir / NORMALIZATION_FILE).read_bytes())
     return digest.hexdigest()
 
 
 @torch.inference_mode()
-def validation_loss(process, loader, device, seed=42):
+def validation_loss(process, loader, device, seed=42, prepare=None):
     """検証セット全体でのsegment_weight付き平均損失(と、参考のレコード単位単純平均)を返す。
+
+    バッチに`target_synthetic_mask`(忘却因子で延長した正解の印、`datasets.extension`)があるときは、
+    同じノイズ・タイムステップで合成の月を除いた「実測の月だけの損失」(`real_loss`)も返す
+    (実測の月が1つも無いレコードは除く)。early stoppingには使わない参考値。
 
     バッチごとに重み付き平均を取って平均する方式ではなく、検証セット全体の
     Σ(w·loss)/Σw を計算する(バッチ構成に結果が依存しないようにするため)。
+
+    prepare: 指定時は各バッチに`prepare(batch, generator)`を適用してから損失を計算する
+        (混合guide・残差方式。`generator`はnoise/timestepsとは別の、固定seedの乱数)。
     """
     process.model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
+    prepare_generator = torch.Generator(device=device).manual_seed(seed + 1)
     weighted_sum, weight_sum, record_sum, count = 0.0, 0.0, 0.0, 0
+    real_sum, real_weight = 0.0, 0.0
     for batch in loader:
         batch = _move(batch, device)
+        if prepare is not None:
+            batch = prepare(batch, prepare_generator)
         size = batch["target"].shape[0]
         timesteps = torch.randint(0, process.steps, (size,), device=device, generator=generator)
         noise = torch.randn(batch["target"].shape, device=device, generator=generator)
@@ -82,17 +100,37 @@ def validation_loss(process, loader, device, seed=42):
         weight_sum += float(weights.sum())
         record_sum += float(per_record.sum())
         count += size
+        if "target_synthetic_mask" in batch:
+            real_mask = batch["target_mask"] * (1 - batch["target_synthetic_mask"])
+            real_record = process.per_record_loss({**batch, "target_mask": real_mask}, noise=noise, timesteps=timesteps)
+            real_weights = weights * (real_mask.sum(dim=1) > 0)
+            real_sum += float((real_weights * real_record).sum())
+            real_weight += float(real_weights.sum())
     if weight_sum <= 0:
         raise ValueError("検証セットの重みの合計が0です。")
-    return {"loss": weighted_sum / weight_sum, "record_loss": record_sum / max(count, 1)}
+    result = {"loss": weighted_sum / weight_sum, "record_loss": record_sum / max(count, 1)}
+    if real_weight > 0:
+        result["real_loss"] = real_sum / real_weight
+    return result
 
 
 def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
           accumulation_steps=2, learning_rate=1e-4, weight_decay=1e-4,
           dropout=0.1, patience=20, min_delta=1e-4, ema_decay=0.999,
           seed=42, resume=True, progress=True, prediction_type="epsilon",
-          diffusion_steps=1000, self_target_loss_weight=0.0):
+          diffusion_steps=1000, self_target_loss_weight=0.0, guide_mix_probability_zero=None,
+          target_mode="absolute", cycle_features=False):
     """RMAを学習する。dataset_dirは`write_dataset`が書き出したディレクトリ。
+
+    guide_mix_probability_zero: Noneでなければ、各学習サンプルのguideを
+        `λ·正解 + (1−λ)·実guide`に置き換える(確率この値でλ=0、それ以外はλ~U(0,1)。
+        `training/guide_mixing.py`、2026-10-16 手順2)。validation_lossも固定seedで同じ分布の
+        λを引いて計算し(best選定に使う)、参考としてλ=0だけの損失も記録する。
+    cycle_features: Trueのとき、データセットの`cycle_features.npy`(忘却因子Dの要約8個)を条件入力に足す
+        (`cycle_feature_dim=8`、model_configに保存)。データセットに無ければエラー。
+    target_mode: "absolute"(既定、実測値を生成)/"residual"(`正解 − 基準線`を生成。基準線は
+        current + guideの変化量の平均。残差の正規化統計はmodel_train(λ=0)からfitして
+        model_configに保存し、`predict`が物理値に戻すときに使う)。
 
     self_target_loss_weight: 0より大きい場合、通常の損失(実際の検索結果によるguide)に
         加えて、同じバッチ・同じノイズ・同じタイムステップで、guideを自分自身の正解に
@@ -110,6 +148,13 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         raise ValueError("diffusion_steps must be positive")
     if float(self_target_loss_weight) < 0:
         raise ValueError("self_target_loss_weight must be non-negative")
+    if target_mode not in TARGET_MODES:
+        raise ValueError(f"target_mode must be one of {TARGET_MODES}")
+    mixing = guide_mix_probability_zero is not None
+    if mixing and not 0.0 <= float(guide_mix_probability_zero) <= 1.0:
+        raise ValueError("guide_mix_probability_zero must be between 0 and 1")
+    if (mixing or target_mode != "absolute") and float(self_target_loss_weight) > 0:
+        raise ValueError("self_target_loss_weightは混合guide・残差方式と併用できません")
     torch.manual_seed(seed)
     dataset_dir, output_dir = Path(dataset_dir).resolve(), Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -130,10 +175,36 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         train_metadata = pd.read_csv(dataset_dir / "model_train" / "metadata.csv", encoding="utf-8-sig")
         current_values = train_metadata["current_acc_z_max"].to_numpy(dtype=np.float32)
 
-    model_config = {"dropout": float(dropout), "forecast_months": 12, "target_mode": "absolute",
+    model_config = {"dropout": float(dropout), "forecast_months": 12, "target_mode": target_mode,
                     "prediction_type": prediction_type, "diffusion_steps": int(diffusion_steps),
                     "self_target_loss_weight": self_target_loss_weight}
-    model = ReferenceModulatedUNetV2(dropout).to(device)
+    cycle_feature_dim = FEATURE_DIM if cycle_features else 0
+    if cycle_features:
+        if train_data.cycle_features is None or valid_data.cycle_features is None:
+            raise ValueError("--cycle-features にはデータセットの cycle_features.npy が必要です。")
+        model_config["cycle_feature_dim"] = cycle_feature_dim
+    # 新しい設定は既定値のときはキー自体を足さない(既存checkpointのresume時の構成チェックと互換)。
+    norms = {"condition_norm": train_data.condition_norm, "target_norm": train_data.target_norm}
+    residual = None
+    if mixing:
+        model_config["guide_mix_probability_zero"] = float(guide_mix_probability_zero)
+    if target_mode == "residual":
+        residual = fit_residual_target(
+            DataLoader(train_data, batch_size=batch_size, shuffle=False, num_workers=0), device=device, **norms
+        )
+        model_config["residual_target"] = residual
+
+    def prepare(batch, lambda_generator, *, lambda_zero=False):
+        if mixing and not lambda_zero:
+            lam = sample_lambdas(batch["target"].shape[0], generator=lambda_generator,
+                                 p_zero=float(guide_mix_probability_zero))
+            batch = mix_guide_batch(batch, lam, **norms)
+        if residual is not None:
+            batch = to_residual(batch, residual, **norms)
+        return batch
+
+    use_prepare = mixing or residual is not None
+    model = ReferenceModulatedUNetV2(dropout, cycle_feature_dim=cycle_feature_dim).to(device)
     process = DiffusionProcess(model, diffusion_steps, prediction_type=prediction_type).to(device)
     ema = EMA(model, ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -164,12 +235,16 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         from tqdm import tqdm
         epoch_range = tqdm(epoch_range, desc="学習epoch", unit="epoch")
     started = time.perf_counter()
+    # λの乱数はnoise/timestepsとは別系列にする(混合なしの既定動作の乱数消費を変えないため)。
+    lambda_generator = torch.Generator(device=device).manual_seed(seed + 2)
     for epoch in epoch_range:
         model.train()
         optimizer.zero_grad(set_to_none=True)
         weighted_sum, weight_sum, batches = 0.0, 0.0, 0
         for batch_index, batch in enumerate(train_loader):
             batch = _move(batch, device)
+            if use_prepare:
+                batch = prepare(batch, lambda_generator)
             # noise/timestepsをここで明示的に事前サンプリングし、self_target_loss_weight>0の
             # ときはreal/self_target両方のper_record_loss呼び出しに同じ値を渡す(noisyが
             # 完全に同一になり、2つの損失の差がguideの中身だけに起因する低分散な対比較に
@@ -204,7 +279,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         train_loss = weighted_sum / max(weight_sum, 1e-12)
 
         validation_process = DiffusionProcess(ema.model, diffusion_steps, prediction_type=prediction_type).to(device)
-        validation = validation_loss(validation_process, valid_loader, device, seed)
+        validation = validation_loss(validation_process, valid_loader, device, seed,
+                                     prepare=prepare if use_prepare else None)
         improved = validation["loss"] < best - min_delta
         if improved:
             best, stale = validation["loss"], 0
@@ -215,6 +291,13 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
             "validation_record_loss": validation["record_loss"], "best_validation_loss": best,
             "learning_rate": optimizer.param_groups[0]["lr"], "elapsed_seconds": time.perf_counter() - started,
         })
+        if "real_loss" in validation:
+            history[-1]["validation_loss_real_months"] = validation["real_loss"]
+        if mixing:
+            history[-1]["validation_loss_lambda0"] = validation_loss(
+                validation_process, valid_loader, device, seed,
+                prepare=lambda batch, generator: prepare(batch, generator, lambda_zero=True),
+            )["loss"]
         pd.DataFrame(history).to_csv(output_dir / "training_history.csv", index=False, encoding="utf-8-sig")
         checkpoint = {
             "epoch": epoch, "model_state_dict": model.state_dict(), "ema_state_dict": ema.state_dict(),

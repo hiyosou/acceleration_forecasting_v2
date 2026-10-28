@@ -26,6 +26,28 @@ ARRAY_NAMES = (
     "guide_similarities", "retrieval_masks", "guide_baselines", "guide_softmax_weights",
     "segment_weights", "target_values", "target_masks",
 )
+# 正解のうち合成値(`datasets.extension`、2026-10-22)で埋めた月=1。これより前に作ったデータセットには
+# 無いので必須にはせず、無ければ全て0(実測)として扱う。
+OPTIONAL_ARRAY_NAMES = ("target_synthetic_masks",)
+
+
+def load_split_arrays(split_dir, *, mmap_mode=None) -> dict:
+    """splitディレクトリの配列を読む(任意の配列はファイルがあるときだけ)。"""
+    from pathlib import Path
+
+    split_dir = Path(split_dir)
+    arrays = {name: np.load(split_dir / f"{name}.npy", mmap_mode=mmap_mode) for name in ARRAY_NAMES}
+    for name in OPTIONAL_ARRAY_NAMES:
+        if (split_dir / f"{name}.npy").is_file():
+            arrays[name] = np.load(split_dir / f"{name}.npy", mmap_mode=mmap_mode)
+    return arrays
+
+
+def real_target_masks(arrays) -> np.ndarray:
+    """正解のmaskから合成の月を除いたもの(合成の無いデータセットではtarget_masksそのもの)。"""
+    masks = np.asarray(arrays["target_masks"])
+    synthetic = arrays.get("target_synthetic_masks")
+    return masks if synthetic is None else masks * (1.0 - np.asarray(synthetic))
 
 
 @dataclass(frozen=True)
@@ -85,7 +107,7 @@ def build_raw_split(
         target_mode=absolute(anchor.future_valuesそのもの)。
     """
     metadata_rows = []
-    arrays = {name: [] for name in ARRAY_NAMES}
+    arrays = {name: [] for name in ARRAY_NAMES + OPTIONAL_ARRAY_NAMES}
     for anchor in anchors:
         query_vectors = query_vectors_by_trend_id.get(anchor.trend_id, [])
         guides = []
@@ -100,6 +122,9 @@ def build_raw_split(
             guides, top_k, forecast_months, anchor.current_acc_z_max, temperature,
         )
         segment_weight = segment_weights[anchor.dataset_id]
+        synthetic = (np.zeros(forecast_months, np.float32) if anchor.future_synthetic_mask is None
+                     else np.asarray(anchor.future_synthetic_mask, np.float32))
+        synthetic_months = int(np.count_nonzero(synthetic > 0))
 
         metadata_rows.append({
             "trend_id": anchor.trend_id, "dataset_id": anchor.dataset_id,
@@ -108,6 +133,8 @@ def build_raw_split(
             "current_acc_z_max": anchor.current_acc_z_max,
             "valid_history_months": anchor.valid_history_months,
             "valid_future_months": anchor.valid_future_months,
+            "synthetic_future_months": synthetic_months,
+            "months_after_maintenance": anchor.months_after_maintenance,
             "guide_count": len(guides), "segment_weight": segment_weight,
             # guideの出所(リーク検証・追跡用): 各guideのtrend_id/dataset_id/model_split。
             "guide_trend_ids": json.dumps([str(guide["trend_id"]) for guide in guides]),
@@ -126,6 +153,7 @@ def build_raw_split(
         arrays["segment_weights"].append(np.float32(segment_weight))
         arrays["target_values"].append(anchor.future_values)
         arrays["target_masks"].append(anchor.future_mask)
+        arrays["target_synthetic_masks"].append(synthetic)
 
     stacked = {name: np.asarray(values, dtype=np.float32) for name, values in arrays.items()}
     metadata = pd.DataFrame(metadata_rows)
@@ -145,7 +173,8 @@ def fit_condition_and_target_normalization(model_train_raw: RawSplit) -> tuple[N
     condition_values = np.concatenate([history, guides]) if guides.size else history
     condition_norm = Normalization.fit(condition_values, "model_train_condition")
 
-    target = model_train_raw.arrays["target_values"][model_train_raw.arrays["target_masks"] > 0]
+    # 合成値(datasets.extension)で埋めた月は使わず、実測の月だけでfitする(2026-10-22)。
+    target = model_train_raw.arrays["target_values"][real_target_masks(model_train_raw.arrays) > 0]
     target_norm = Normalization.fit(target, "model_train_target_absolute")
     return condition_norm, target_norm
 
@@ -160,7 +189,7 @@ def write_split(raw: RawSplit, split_dir) -> None:
 
     split_dir = Path(split_dir)
     split_dir.mkdir(parents=True, exist_ok=True)
-    for name in ARRAY_NAMES:
+    for name in ARRAY_NAMES + tuple(name for name in OPTIONAL_ARRAY_NAMES if name in raw.arrays):
         np.save(split_dir / f"{name}.npy", np.asarray(raw.arrays[name], dtype=np.float32))
     raw.metadata.to_csv(split_dir / "metadata.csv", index=False, encoding="utf-8-sig")
 

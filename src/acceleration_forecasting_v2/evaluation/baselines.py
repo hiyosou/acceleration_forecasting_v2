@@ -71,16 +71,17 @@ def history_features(history, anchor_months=None):
     return np.nan_to_num(np.column_stack(columns))
 
 
-def fit_history_ridge(train_dir, *, use_anchor_month=True, ridge_lambda=RIDGE_LAMBDA):
-    """`model_train`で月ごとのridge回帰(segment_weight付き、切片は正則化しない)を学習する。
+def fit_weighted_ridge(features, train_dir, *, ridge_lambda=RIDGE_LAMBDA):
+    """月ごとのridge回帰(segment_weight付き、切片=先頭列は正則化しない)を解く。
+
+    `features`の先頭列は切片で、残りの列は学習データの平均・標準偏差で標準化する。
+    正解・マスク・重みは`train_dir`の`.npy`から読む。
 
     Returns:
-        dict(coefficients (n_features, months), mean/std(標準化統計), use_anchor_month)。
+        dict(coefficients (n_features, months), mean/std(標準化統計))。
     """
     train_dir = Path(train_dir)
-    metadata = pd.read_csv(train_dir / "metadata.csv", encoding="utf-8-sig")
-    months = _anchor_months(metadata) if use_anchor_month else None
-    features = history_features(_load_history(train_dir), months)
+    features = np.array(features, dtype=float)
     mean, std = features[:, 1:].mean(0), features[:, 1:].std(0) + 1e-9
     features[:, 1:] = (features[:, 1:] - mean) / std
     targets = np.load(train_dir / "target_values.npy").astype(float)
@@ -93,16 +94,34 @@ def fit_history_ridge(train_dir, *, use_anchor_month=True, ridge_lambda=RIDGE_LA
         rows = target_masks[:, month]
         x, y, w = features[rows], targets[rows, month], weights[rows]
         coefficients[:, month] = np.linalg.solve(x.T @ (x * w[:, None]) + penalty, x.T @ (w * y))
-    return {"coefficients": coefficients, "mean": mean, "std": std, "use_anchor_month": months is not None}
+    return {"coefficients": coefficients, "mean": mean, "std": std}
+
+
+def apply_weighted_ridge(model, features):
+    features = np.array(features, dtype=float)
+    features[:, 1:] = (features[:, 1:] - model["mean"]) / model["std"]
+    return features @ model["coefficients"]
+
+
+def fit_history_ridge(train_dir, *, use_anchor_month=True, ridge_lambda=RIDGE_LAMBDA):
+    """`model_train`で月ごとのridge回帰(segment_weight付き、切片は正則化しない)を学習する。
+
+    Returns:
+        dict(coefficients (n_features, months), mean/std(標準化統計), use_anchor_month)。
+    """
+    train_dir = Path(train_dir)
+    metadata = pd.read_csv(train_dir / "metadata.csv", encoding="utf-8-sig")
+    months = _anchor_months(metadata) if use_anchor_month else None
+    features = history_features(_load_history(train_dir), months)
+    model = fit_weighted_ridge(features, train_dir, ridge_lambda=ridge_lambda)
+    return {**model, "use_anchor_month": months is not None}
 
 
 def predict_history_ridge(model, history, metadata=None):
     months = _anchor_months(metadata) if model["use_anchor_month"] else None
     if model["use_anchor_month"] and months is None:
         raise ValueError("学習時はanchor月を使ったが、予測対象のmetadataにanchor_date列がありません。")
-    features = history_features(history, months)
-    features[:, 1:] = (features[:, 1:] - model["mean"]) / model["std"]
-    return features @ model["coefficients"]
+    return apply_weighted_ridge(model, history_features(history, months))
 
 
 def baseline_predictions(dataset_dir, split="inference"):

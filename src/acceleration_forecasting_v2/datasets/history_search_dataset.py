@@ -37,15 +37,16 @@ import pandas as pd
 from acceleration_forecasting_v2.common.constants import FORECAST_MONTHS, TOP_K
 from acceleration_forecasting_v2.retrieval.database import connect_read_only
 from acceleration_forecasting_v2.retrieval.search import GuideIndex, SearchConfig
-from .build import ARRAY_NAMES, RawSplit, _build_guide_arrays, fit_condition_and_target_normalization, write_split
+from .build import RawSplit, _build_guide_arrays, fit_condition_and_target_normalization, load_split_arrays, write_split
 from .normalization import Normalization
 from .prepare import GUIDE_SOURCE_SPLITS
 
 SPLITS = ("model_train", "model_validation", "inference")
+SEARCH_METHODS = ("history_rmse", "waveform_history_cosine")
 
 
 def _search_split_guides(guide_index, split_dir, *, allowed_splits, search_config, top_k,
-                          forecast_months, temperature):
+                          forecast_months, temperature, waveform_index=None):
     """1split分のhistory_values/metadataから、search_by_historyでguide配列一式を作る。
 
     `build_history_search_inference_dataset`(inference限定)と
@@ -61,12 +62,13 @@ def _search_split_guides(guide_index, split_dir, *, allowed_splits, search_confi
 
     for position, row in enumerate(metadata.itertuples(index=False)):
         current = float(row.current_acc_z_max)
-        guides = guide_index.search_by_history(
-            history_values[position], history_masks[position],
-            query_date=str(row.anchor_date), query_dataset_id=str(row.dataset_id),
-            query_current=current, query_bin_start_m=float(row.bin_start_m),
-            allowed_splits=allowed_splits, config=search_config,
-        )
+        query = dict(query_date=str(row.anchor_date), query_dataset_id=str(row.dataset_id),
+                     query_current=current, query_bin_start_m=float(row.bin_start_m),
+                     allowed_splits=allowed_splits, config=search_config)
+        if waveform_index is None:
+            guides = guide_index.search_by_history(history_values[position], history_masks[position], **query)
+        else:
+            guides = waveform_index.search(str(row.trend_id), **query)
         guide_values, guide_masks, guide_deltas, similarities, retrieval_masks, baseline, weights = _build_guide_arrays(
             guides, top_k, forecast_months, current, temperature,
         )
@@ -92,7 +94,7 @@ def _search_split_guides(guide_index, split_dir, *, allowed_splits, search_confi
         "guide_softmax_weights": np.asarray(weights_all, dtype=np.float32),
     }
     new_metadata = metadata.copy()
-    new_metadata["guide_search_method"] = "history_rmse"
+    new_metadata["guide_search_method"] = "history_rmse" if waveform_index is None else "waveform_history_cosine"
     new_metadata["guide_count"] = guide_counts
     new_metadata["guide_trend_ids"] = guide_trend_id_lists
     new_metadata["guide_dataset_ids"] = guide_dataset_id_lists
@@ -103,10 +105,17 @@ def _search_split_guides(guide_index, split_dir, *, allowed_splits, search_confi
 def build_history_search_dataset(
     source_dataset_dir, artifact_dir, output_dataset_dir, *,
     splits_to_rebuild=SPLITS, search_config: SearchConfig = SearchConfig(), top_k: int = TOP_K,
-    forecast_months: int = FORECAST_MONTHS, temperature: float = 0.1,
+    forecast_months: int = FORECAST_MONTHS, temperature: float = 0.1, search_method: str = "history_rmse",
+    device=None, database_path=None,
 ) -> dict:
     """`splits_to_rebuild`で指定した各splitのguideを`search_by_history`で作り直す
     (P3: 学習データ自体を新しい検索方法で作り直す)。
+
+    database_path: 既定は`artifact_dir/vector_database.sqlite`。忘却因子で延長したDB
+        (`datasets.extension.build_extended_artifacts`)を使うときに指定する。
+    search_method: "history_rmse"(既定、6か月の月最大加速度のRMSE)または
+        "waveform_history_cosine"(6か月の波形埋め込みのコサイン類似度、
+        `retrieval/waveform_history.py`、2026-10-20)。
 
     `splits_to_rebuild`に含まれないsplitは`shutil.copytree`でbyte-identicalにコピー
     するだけ(`pd.read_csv`→`to_csv`の往復はfloat列の桁落ちを起こし得るため使わない
@@ -130,8 +139,14 @@ def build_history_search_dataset(
 
     guide_index = None
     if splits_to_rebuild:
-        database_path = artifact_dir / "vector_database.sqlite"
+        database_path = Path(database_path) if database_path else artifact_dir / "vector_database.sqlite"
         guide_index = GuideIndex(connect_read_only(database_path))
+    if search_method not in SEARCH_METHODS:
+        raise ValueError(f"search_methodは{SEARCH_METHODS}のいずれか: {search_method!r}")
+    waveform_index = None
+    if guide_index is not None and search_method == "waveform_history_cosine":
+        from acceleration_forecasting_v2.retrieval.waveform_history import build_waveform_history_index
+        waveform_index = build_waveform_history_index(guide_index, artifact_dir, device=device)
 
     raw_splits: dict[str, RawSplit] = {}
     rebuilt_counts = {}
@@ -140,11 +155,11 @@ def build_history_search_dataset(
         if not split_dir.is_dir():
             continue
         if split in splits_to_rebuild:
-            arrays = {name: np.load(split_dir / f"{name}.npy") for name in ARRAY_NAMES}
+            arrays = load_split_arrays(split_dir)
             overrides, metadata = _search_split_guides(
                 guide_index, split_dir, allowed_splits=GUIDE_SOURCE_SPLITS[split],
                 search_config=search_config, top_k=top_k, forecast_months=forecast_months,
-                temperature=temperature,
+                temperature=temperature, waveform_index=waveform_index,
             )
             arrays.update(overrides)
             raw_splits[split] = RawSplit(arrays=arrays, metadata=metadata)
@@ -168,8 +183,9 @@ def build_history_search_dataset(
         write_split(raw, output_dataset_dir / split)
 
     summary = {
-        "guide_search_method": "history_rmse", "splits_rebuilt": sorted(splits_to_rebuild),
+        "guide_search_method": search_method, "splits_rebuilt": sorted(splits_to_rebuild),
         "source_dataset": str(source_dataset_dir), "artifact_dir": str(artifact_dir),
+        "database_path": str(database_path) if guide_index is not None else None,
         "output_dataset": str(output_dataset_dir), "search_config": asdict(search_config),
         "rebuilt_counts": rebuilt_counts,
         "condition_normalization": {"mean": condition_norm.mean, "std": condition_norm.std,

@@ -12,11 +12,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from acceleration_forecasting_v2.evaluation.evaluate import load_target_masks
 from .normalization import Normalization
 from .prepare import GUIDE_SOURCE_SPLITS, SPLITS
 
 
-def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None) -> list[str]:
+def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None, *, no_synthetic_splits=(),
+                           min_months_after_maintenance=None, maintenance_rule_splits=()) -> list[str]:
     """違反の説明文のリストを返す(空ならリークなし)。
 
     検査項目:
@@ -26,6 +28,9 @@ def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None) ->
       4. segment_weightがsplit内でdataset_idごとに合計1になる
       5. 正規化統計(target)が、model_trainの有効な正解値のみから計算されている
       6. manifestを渡した場合、guideの(trend_id → dataset_id/model_split)がmanifestと一致する
+      7. `no_synthetic_splits`のsplitの正解に、合成値(`datasets.extension`)で埋めた月が無い
+      8. `maintenance_rule_splits`のsplitの起点が、補修から`min_months_after_maintenance`か月以上
+    target正規化統計(5)は、合成の月を除いた実測の月だけと比べる。
     """
     dataset_dir = Path(dataset_dir)
     violations: list[str] = []
@@ -62,9 +67,24 @@ def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None) ->
             if not np.isclose(total, 1.0, atol=1e-5):
                 violations.append(f"{split}/{dataset_id}: segment_weightの合計が1でない({total:.6f})")
 
+    for split in no_synthetic_splits:
+        path = dataset_dir / split / "target_synthetic_masks.npy"
+        if path.is_file() and np.load(path).any():
+            violations.append(f"{split}: 合成値で埋めた正解の月がある({int(np.load(path).sum())}か月)")
+    for split in maintenance_rule_splits:
+        frame = metadata.get(split)
+        if frame is None:
+            continue
+        months = pd.to_numeric(frame.get("months_after_maintenance"), errors="coerce")
+        if months is None or months.isna().any():
+            violations.append(f"{split}: months_after_maintenanceが無い起点がある")
+        elif (months < int(min_months_after_maintenance)).any():
+            violations.append(f"{split}: 補修から{min_months_after_maintenance}か月未満の起点が"
+                              f"{int((months < int(min_months_after_maintenance)).sum())}件ある")
+
     if (dataset_dir / "model_train").is_dir():
         values = np.load(dataset_dir / "model_train" / "target_values.npy")
-        masks = np.load(dataset_dir / "model_train" / "target_masks.npy")
+        masks = load_target_masks(dataset_dir / "model_train", "real")
         train_values = values[masks > 0]
         norm = Normalization.load(dataset_dir / "target_normalization.json")
         if norm.count != train_values.size or not np.isclose(norm.mean, float(train_values.mean()), rtol=1e-4):

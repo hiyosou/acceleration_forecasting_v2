@@ -16,6 +16,7 @@ from acceleration_forecasting_v2.retrieval.search import GuideIndex, SearchConfi
 from acceleration_forecasting_v2.datasets.anchors import AnchorCandidate, compute_segment_weights
 from acceleration_forecasting_v2.datasets.build import (
     ARRAY_NAMES,
+    OPTIONAL_ARRAY_NAMES,
     build_raw_split,
     fit_condition_and_target_normalization,
 )
@@ -81,9 +82,11 @@ def test_build_raw_split_produces_all_array_names_with_matching_row_count(tmp_pa
         allowed_guide_splits={"model_train"}, segment_weights=segment_weights,
     )
     assert result.metadata.iloc[0]["guide_count"] == 1
-    assert set(result.arrays.keys()) == set(ARRAY_NAMES)
-    for name in ARRAY_NAMES:
+    assert set(result.arrays.keys()) == set(ARRAY_NAMES) | set(OPTIONAL_ARRAY_NAMES)
+    for name in ARRAY_NAMES + OPTIONAL_ARRAY_NAMES:
         assert result.arrays[name].shape[0] == 1
+    # 合成値の無いanchorでは、合成の印は全て0(=全て実測)。
+    np.testing.assert_array_equal(result.arrays["target_synthetic_masks"], np.zeros((1, 12), np.float32))
     assert result.arrays["guide_values"].shape == (1, 3, 12)
     assert result.arrays["guide_softmax_weights"].shape == (1, 3, 12)
     assert result.arrays["history_values"].shape == (1, 6)

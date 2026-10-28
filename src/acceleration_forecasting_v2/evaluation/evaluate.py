@@ -24,9 +24,25 @@ from .aggregate import (
 from .baselines import baseline_predictions
 from .metrics import target_metrics
 
+MONTH_FILTERS = ("all", "real")
 
-def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_target_months=8):
+
+def load_target_masks(split_dir, month_filter="all"):
+    """正解のmask。month_filter="real"なら合成値(`datasets.extension`)で埋めた月を除く。"""
+    if month_filter not in MONTH_FILTERS:
+        raise ValueError(f"month_filterは{MONTH_FILTERS}のいずれか: {month_filter!r}")
+    split_dir = Path(split_dir)
+    masks = np.load(split_dir / "target_masks.npy")
+    synthetic_path = split_dir / "target_synthetic_masks.npy"
+    if month_filter == "real" and synthetic_path.is_file():
+        masks = masks * (1.0 - np.load(synthetic_path))
+    return masks
+
+
+def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_target_months=8, month_filter="all"):
     """レコードごとの指標表を作る。
+
+    month_filter: "all"(既定)は正解の有効な月すべて、"real"は合成値で埋めた月を除いた実測の月だけで評価する。
 
     Returns:
         (評価対象の表, 集計前の件数dict)。有効な正解月が`min_target_months`未満のレコードは
@@ -36,7 +52,7 @@ def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_targ
     split_dir = dataset_dir / split
     metadata = pd.read_csv(split_dir / "metadata.csv", encoding="utf-8-sig")
     targets = np.load(split_dir / "target_values.npy")
-    masks = np.load(split_dir / "target_masks.npy")
+    masks = load_target_masks(split_dir, month_filter)
     baselines = np.load(split_dir / "guide_baselines.npy")
     predictions = pd.read_csv(prediction_dir / "predictions.csv", encoding="utf-8-sig")
     reference_predictions = baseline_predictions(dataset_dir, split)
@@ -75,11 +91,12 @@ def per_target_frame(dataset_dir, prediction_dir, *, split="inference", min_targ
 
 
 def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_target_months=8,
-             bootstrap=1000, seed=42):
+             bootstrap=1000, seed=42, month_filter="all"):
     """評価を実行し、per-record表・per-segment表・bootstrap結果・summary JSONを書き出す。"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    frame, counts = per_target_frame(dataset_dir, prediction_dir, split=split, min_target_months=min_target_months)
+    frame, counts = per_target_frame(dataset_dir, prediction_dir, split=split, min_target_months=min_target_months,
+                                     month_filter=month_filter)
     if frame.empty:
         raise ValueError("評価対象のレコードがありません(min_target_monthsを満たすレコードが0件)。")
     names = METRIC_NAMES + BASELINE_METRIC_NAMES + REFERENCE_METRIC_NAMES
@@ -90,7 +107,7 @@ def evaluate(dataset_dir, prediction_dir, output_dir, *, split="inference", min_
         "record_level": evaluate_record_level(frame, names),
         "segment_level": evaluate_segment_level(frame, names),
         "counts": {**counts, "segment_count": int(frame["dataset_id"].nunique())},
-        "config": {"split": split, "min_target_months": int(min_target_months),
+        "config": {"split": split, "min_target_months": int(min_target_months), "month_filter": month_filter,
                    "bootstrap_iterations": int(bootstrap), "seed": int(seed)},
     }
     if int(bootstrap) > 0:
