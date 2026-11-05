@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
+from acceleration_forecasting_v2.common.constants import HISTORY_MONTHS, PHYSICAL_MAX, PHYSICAL_MIN
 from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.diffusion.process import DEFAULT_START_TIMESTEP, DiffusionProcess
@@ -35,7 +35,8 @@ def load_process(checkpoint_path, device, *, use_ema=True):
     state_dict = checkpoint["ema_state_dict" if use_ema else "model_state_dict"]
     context_residual_enabled = any("context_residual" in key for key in state_dict)
     model = ReferenceModulatedUNetV2(config["dropout"], context_residual_enabled=context_residual_enabled,
-                                     cycle_feature_dim=config.get("cycle_feature_dim", 0)).to(device)
+                                     cycle_feature_dim=config.get("cycle_feature_dim", 0),
+                                     history_months=config.get("history_months", HISTORY_MONTHS)).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     process = DiffusionProcess(model, config["diffusion_steps"], prediction_type=config["prediction_type"]).to(device)

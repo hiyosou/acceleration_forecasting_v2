@@ -18,7 +18,8 @@ from .prepare import GUIDE_SOURCE_SPLITS, SPLITS
 
 
 def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None, *, no_synthetic_splits=(),
-                           min_months_after_maintenance=None, maintenance_rule_splits=()) -> list[str]:
+                           min_months_after_maintenance=None, maintenance_rule_splits=(),
+                           max_months_after_maintenance=None) -> list[str]:
     """違反の説明文のリストを返す(空ならリークなし)。
 
     検査項目:
@@ -30,6 +31,8 @@ def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None, *,
       6. manifestを渡した場合、guideの(trend_id → dataset_id/model_split)がmanifestと一致する
       7. `no_synthetic_splits`のsplitの正解に、合成値(`datasets.extension`)で埋めた月が無い
       8. `maintenance_rule_splits`のsplitの起点が、補修から`min_months_after_maintenance`か月以上
+      9. `max_months_after_maintenance`を指定したとき、全splitで、補修の月から数えてその月数を超える正解の月が
+         有効(mask=1)になっていない
     target正規化統計(5)は、合成の月を除いた実測の月だけと比べる。
     """
     dataset_dir = Path(dataset_dir)
@@ -81,6 +84,19 @@ def verify_dataset_leakage(dataset_dir, manifest: pd.DataFrame | None = None, *,
         elif (months < int(min_months_after_maintenance)).any():
             violations.append(f"{split}: 補修から{min_months_after_maintenance}か月未満の起点が"
                               f"{int((months < int(min_months_after_maintenance)).sum())}件ある")
+
+    if max_months_after_maintenance is not None:
+        for split, frame in metadata.items():
+            months = pd.to_numeric(frame.get("months_after_maintenance"), errors="coerce")
+            if months is None or months.isna().any():
+                violations.append(f"{split}: months_after_maintenanceが無い起点があり、補修後の上限を検査できない")
+                continue
+            masks = np.load(dataset_dir / split / "target_masks.npy") > 0
+            target_month = months.to_numpy()[:, None] + np.arange(1, masks.shape[1] + 1)[None, :]
+            over = masks & (target_month > int(max_months_after_maintenance))
+            if over.any():
+                violations.append(f"{split}: 補修から{max_months_after_maintenance}か月を超える正解の月が"
+                                  f"有効になっている({int(over.sum())}か月)")
 
     if (dataset_dir / "model_train").is_dir():
         values = np.load(dataset_dir / "model_train" / "target_values.npy")

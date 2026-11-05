@@ -78,6 +78,7 @@ def select_anchors_for_segment(
     history_months: int = 6,
     forecast_months: int = 12,
     min_months_after_maintenance: int | None = None,
+    max_months_after_maintenance: int | None = None,
 ) -> list[AnchorCandidate]:
     """1つのdataset_id(施工間セグメント)内で、適格性条件を満たす月を全て拾う。
 
@@ -93,6 +94,9 @@ def select_anchors_for_segment(
         min_target_months: 12か月中、有効な月が何か月以上必要か(inferenceでは未使用)。合成値で埋めた月も数える。
         min_months_after_maintenance: 指定すると「起点の月 − サイクル起点(補修)の月」がこの値以上の
             起点だけを残す(5なら入力の6か月がすべて補修後に収まる。2026-10-22)。`cycle_start`列が必要。
+        max_months_after_maintenance: 指定すると、正解12か月のうち「補修の月から数えてこの月数を超える月」を
+            欠測にする(mask=0・値NaN・合成mask=0。実測も合成も外す)。そのうえで有効な目標月数を数えるので、
+            `min_target_months`の判定にも効く(24なら補修後2年までを目標とする。2026-11)。`cycle_start`列が必要。
 
     Returns:
         measurement_date昇順にソートされたAnchorCandidateのリスト。
@@ -122,6 +126,14 @@ def select_anchors_for_segment(
         valid_history_months = int(np.count_nonzero(history_mask > 0))
 
         future_values, future_mask = _parse_future(row, forecast_months)
+        future_synthetic_mask = _parse_synthetic(row, forecast_months)
+        if max_months_after_maintenance is not None:
+            if months_after is None:
+                raise ValueError("max_months_after_maintenanceにはtrend_catalogのcycle_start列が必要です。")
+            beyond = months_after + np.arange(1, forecast_months + 1) > int(max_months_after_maintenance)
+            future_values = np.where(beyond, np.nan, future_values).astype(np.float32)
+            future_mask = np.where(beyond, 0.0, future_mask).astype(np.float32)
+            future_synthetic_mask = np.where(beyond, 0.0, future_synthetic_mask).astype(np.float32)
         valid_future_months = int(np.count_nonzero((future_mask > 0) & np.isfinite(future_values)))
 
         production_ready = current_valid and valid_history_months >= min_history_months
@@ -145,7 +157,7 @@ def select_anchors_for_segment(
                 future_mask=future_mask,
                 valid_history_months=valid_history_months,
                 valid_future_months=valid_future_months,
-                future_synthetic_mask=_parse_synthetic(row, forecast_months),
+                future_synthetic_mask=future_synthetic_mask,
                 months_after_maintenance=months_after,
             )
         )

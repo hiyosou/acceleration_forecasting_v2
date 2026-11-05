@@ -501,7 +501,8 @@ def _render_record(metadata, trend_catalog, split_dir, samples, trend_id, output
 
     anchor = pd.Timestamp(row["anchor_date"])
     anchor_month = anchor.replace(day=1)
-    history_dates = [anchor_month - pd.DateOffset(months=5 - i) for i in range(5)] + [anchor]
+    history_length = len(history_values)  # 6か月に限らない(拡張ウィンドウでは最大18か月など)
+    history_dates = [anchor_month - pd.DateOffset(months=history_length - 1 - i) for i in range(history_length - 1)] + [anchor]
 
     direction, bin_start_m, bin_end_m = row["direction"], float(row["bin_start_m"]), float(row["bin_end_m"])
     events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
@@ -751,6 +752,7 @@ def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, 
     guide_masks = np.load(split_dir / "guide_masks.npy")
     target_values = np.load(split_dir / "target_values.npy")
     target_masks = np.load(split_dir / "target_masks.npy")
+    history_length = int(np.load(split_dir / "history_values.npy", mmap_mode="r").shape[1])
     trend_catalog = pd.read_csv(artifact_dir / "trend_catalog.csv", encoding="utf-8-sig")
     velocity_manifest = _load_velocity_manifest(artifact_dir)
     events_by_segment = reconstruct_segment_maintenance_events(trend_catalog)
@@ -768,7 +770,8 @@ def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, 
 
         cycle = cycle_measurements(trend_catalog, row["dataset_id"], anchor)
         section = cycle.rename(columns={"value": "acc_z_max"})
-        history_values, history_masks, history_dates = build_history_window(section, anchor, months=6)
+        history_values, history_masks, history_dates = build_history_window(
+            section, anchor, months=history_length)
         history_dates = pd.to_datetime([date if date else pd.NaT for date in history_dates])
 
         catalog_row = trend_catalog.loc[trend_catalog["trend_id"].astype(str) == trend_id]

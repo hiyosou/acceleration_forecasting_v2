@@ -78,7 +78,8 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
                      temperature=0.1, max_current_difference=0.5, max_datasets_per_split=None,
                      inference_max_per_segment=None, trend_catalog_path=None, database_path=None,
                      extend_splits=None, min_months_after_maintenance=None, maintenance_rule_splits=(),
-                     splits=SPLITS, normalization_dir=None) -> dict:
+                     splits=SPLITS, normalization_dir=None, history_months=HISTORY_MONTHS,
+                     max_months_after_maintenance=None) -> dict:
     """`build_retrieval_database`の出力ディレクトリから学習用データセットを構築する。
 
     Args:
@@ -97,6 +98,10 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
         splits / normalization_dir: model_trainを含めずに一部のsplitだけ作るとき、正規化統計は
             `normalization_dir`の2ファイルをそのままコピーする(同じ学習データで、評価用のinferenceだけを
             別の条件で作り直す用途、2026-10-22)。
+        history_months: 条件入力の履歴の長さ(今月を含む)。補修(サイクル)より前の月は欠測(mask=0)になるので、
+            起点が補修から`history_months`か月未満なら、窓の先頭が補修直後に当たる「伸びていく窓」になる(2026-11)。
+        max_months_after_maintenance: 指定すると全splitで、補修の月から数えてこの月数を超える正解の月を欠測にする
+            (`select_anchors_for_segment`)。trend_catalogの`cycle_start`列が必要。
     """
     artifact_dir, output_dir = Path(artifact_dir), Path(output_dir)
     manifest = pd.read_csv(artifact_dir / "split_manifest.csv", encoding="utf-8-sig")
@@ -134,9 +139,10 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
             segment_anchors = select_anchors_for_segment(
                 split_trends.loc[split_trends["dataset_id"] == dataset_id], split=split,
                 min_history_months=min_history_months, min_target_months=min_target_months,
-                history_months=HISTORY_MONTHS, forecast_months=FORECAST_MONTHS,
+                history_months=int(history_months), forecast_months=FORECAST_MONTHS,
                 min_months_after_maintenance=(min_months_after_maintenance if split in maintenance_rule_splits
                                               else None),
+                max_months_after_maintenance=max_months_after_maintenance,
             )
             if split == "inference" and inference_max_per_segment is not None:
                 segment_anchors = thin_evenly(
@@ -184,7 +190,9 @@ def prepare_datasets(artifact_dir, output_dir, *, device=None, min_history_month
                    "extend_splits": sorted(extend_splits) if extend_splits is not None else None,
                    "min_months_after_maintenance": min_months_after_maintenance,
                    "maintenance_rule_splits": sorted(maintenance_rule_splits), "splits": list(splits),
-                   "normalization_dir": str(normalization_dir) if normalization_dir else None},
+                   "normalization_dir": str(normalization_dir) if normalization_dir else None,
+                   "history_months": int(history_months),
+                   "max_months_after_maintenance": max_months_after_maintenance},
         "splits": {split: {"anchors": int(len(raw.metadata)), "datasets": int(raw.metadata["dataset_id"].nunique()),
                            "anchors_with_guides": int((raw.metadata["guide_count"] > 0).sum()),
                            "synthetic_target_months": int(raw.metadata["synthetic_future_months"].sum())}

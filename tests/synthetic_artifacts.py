@@ -13,7 +13,14 @@ from acceleration_forecasting_v2.retrieval.splitting import assign_model_split
 from acceleration_forecasting_v2.retrieval.trends import TrendCatalog, write_trend_catalog
 
 
-def build_artifacts(artifact_dir, *, n_datasets=12, months=22, embedding_dim=16, seed=0, inference_offset=0.0):
+def start_date(k, staggered_start=False):
+    """セグメントkの最初の計測日。staggered_startなら4種類の開始月にずらす(補修からの経過月数が同じでも
+    計測日が違う候補ができる=「同じ日付は除外」に当たらない)。"""
+    return pd.Timestamp("2022-01-15") + pd.DateOffset(months=(k % 4) if staggered_start else 0)
+
+
+def build_artifacts(artifact_dir, *, n_datasets=12, months=22, embedding_dim=16, seed=0, inference_offset=0.0,
+                    staggered_start=False):
     """n_datasets個のセグメント(各`months`か月ぶんの毎月の計測)からなる成果物一式を作る。
 
     各セグメントは別の区間(bin_start_mが1000mずつ離れている)で、全セグメントが同じ日付列を持つ
@@ -28,7 +35,7 @@ def build_artifacts(artifact_dir, *, n_datasets=12, months=22, embedding_dim=16,
     trend_records, manifest_rows = [], []
     for k in range(n_datasets):
         bin_start = 2000.0 + 1000.0 * k
-        dates = [pd.Timestamp("2022-01-15") + pd.DateOffset(months=i) for i in range(months)]
+        dates = [start_date(k, staggered_start) + pd.DateOffset(months=i) for i in range(months)]
         raw = pd.DataFrame([{
             "dataset_id": f"seg{k:02d}", "direction": "U", "bin_start_m": bin_start, "bin_end_m": bin_start + 100.0,
             "segment_index": 1, "measurement_date": d.strftime("%Y-%m-%d"),

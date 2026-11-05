@@ -32,6 +32,14 @@ class SearchConfig:
     spatial_tolerance_m: float = 1e-6
     # search_by_history専用: 両者ともmask=1の月が何か月以上重ならないと候補から除外するか。
     min_history_overlap_months: int = 3
+    # WaveformHistoryIndex専用(2026-11、拡張ウィンドウ): 候補を「補修からの経過月数(暦月差)が問い合わせと同じ」
+    # ものに限る。窓は補修直後から起点までなので、これは窓の長さが同じ候補だけを比べることと同じ。
+    # 除外規則のあとにtop_k件そろわないときだけ、経過月数の差が`cycle_age_fallback_months`以内まで広げて補う。
+    same_cycle_age: bool = False
+    cycle_age_fallback_months: int = 1
+    # WaveformHistoryIndex専用: 指定すると、ガイド(候補)の将来のうち「候補の補修の月から数えてこの月数を超える月」を
+    # 欠測にする(候補の有効な将来月数もこれで数え直す)。問い合わせ側の目標月の上限と規則をそろえるため。
+    max_months_after_maintenance: int | None = None
 
 
 class GuideIndex:

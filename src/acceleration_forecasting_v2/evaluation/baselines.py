@@ -92,6 +92,8 @@ def fit_weighted_ridge(features, train_dir, *, ridge_lambda=RIDGE_LAMBDA):
     coefficients = np.zeros((features.shape[1], targets.shape[1]))
     for month in range(targets.shape[1]):
         rows = target_masks[:, month]
+        if not rows.any():  # 有効な正解のある起点が1件も無い月(補修後の上限などで起こる)は係数ゼロのまま
+            continue
         x, y, w = features[rows], targets[rows, month], weights[rows]
         coefficients[:, month] = np.linalg.solve(x.T @ (x * w[:, None]) + penalty, x.T @ (w * y))
     return {"coefficients": coefficients, "mean": mean, "std": std}

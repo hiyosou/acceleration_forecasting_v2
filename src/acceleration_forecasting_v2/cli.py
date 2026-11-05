@@ -66,6 +66,14 @@ def _parser():
                    help="--maintenance-rule-splitsのsplitで、起点を補修からこの月数以上に限る")
     p.add_argument("--maintenance-rule-splits", nargs="*", default=(),
                    choices=("model_train", "model_validation", "inference"))
+    p.add_argument("--history-months", type=int, default=6,
+                   help="条件入力の履歴の長さ(今月を含む)。補修より前の月は欠測。既定6")
+    p.add_argument("--max-months-after-maintenance", type=int,
+                   help="全splitで、補修の月から数えてこの月数を超える正解の月を欠測にする(例: 24)")
+    p.add_argument("--splits", nargs="*", choices=("model_train", "model_validation", "inference"),
+                   help="作るsplit(既定は3つ全部)。model_trainを作らないときは--normalization-dirが必要")
+    p.add_argument("--normalization-dir",
+                   help="--splitsにmodel_trainを含めないとき、正規化統計(2ファイル)をコピーする元のデータセット")
     p.add_argument("--max-datasets-per-split", type=int)
     p.add_argument("--inference-max-per-segment", type=int,
                    help="inferenceを評価用セットとして構築し、セグメントごとに日付均等で最大N件へ間引く")
@@ -79,6 +87,8 @@ def _parser():
     p.add_argument("--min-months-after-maintenance", type=int)
     p.add_argument("--maintenance-rule-split", action="append", default=[],
                    help="起点が補修から--min-months-after-maintenanceか月以上であるべきsplit。複数指定可")
+    p.add_argument("--max-months-after-maintenance", type=int,
+                   help="全splitで、補修からこの月数を超える正解の月が有効になっていないことを検査する")
 
     p = commands.add_parser("train", help="RMAを学習")
     p.add_argument("--dataset-dir", required=True)
@@ -101,6 +111,38 @@ def _parser():
                    help="residual: 「正解 − (current + guideの変化量の平均)」を生成する")
     p.add_argument("--cycle-features", action="store_true",
                    help="データセットの cycle_features.npy(忘却因子Dの要約8個、add-cycle-features で作る)を条件入力に足す")
+
+    p = commands.add_parser("rebuild-guides",
+                            help="データセットのguideを波形履歴の検索で作り直して別ディレクトリに書き出す")
+    p.add_argument("--source-dir", required=True, help="元のデータセット(履歴・正解・メタデータはそのまま使う)")
+    p.add_argument("--artifact-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--database-path", help="既定は--artifact-dir内。延長版(extend-trendsの出力)を使うときに指定")
+    p.add_argument("--trend-catalog-path",
+                   help="既定は--artifact-dir内。経過月数を使うときは cycle_start 列のある延長版を指定")
+    p.add_argument("--splits", nargs="*", choices=("model_train", "model_validation", "inference"),
+                   help="作り直すsplit(既定は3つ全部)")
+    p.add_argument("--search-method", choices=("history_rmse", "waveform_history_cosine"),
+                   default="waveform_history_cosine")
+    p.add_argument("--history-months", type=int, default=6,
+                   help="検索の窓の長さ。元のデータセットの履歴の長さとそろえる")
+    p.add_argument("--same-cycle-age", action="store_true",
+                   help="候補を、補修からの経過月数が問い合わせと同じものに限る(拡張ウィンドウ)")
+    p.add_argument("--cycle-age-fallback-months", type=int, default=1,
+                   help="--same-cycle-age で上位3件がそろわないとき、経過月数の差がこの月数以内まで広げて補う")
+    p.add_argument("--max-months-after-maintenance", type=int,
+                   help="ガイドの将来のうち、候補の補修から数えてこの月数を超える月を欠測にする")
+    p.add_argument("--device")
+
+    p = commands.add_parser("evaluate-guide-value",
+                            help="検索の設定だけが違うデータセットどうしで、guideの質を学習なしに比べる")
+    p.add_argument("--run", action="append", required=True, metavar="NAME=DATASET_DIR",
+                   help="比べるデータセット。複数指定可(起点の並びが同じであること)")
+    p.add_argument("--baseline", help="差を出す基準のNAME")
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--split", default="model_validation")
+    p.add_argument("--no-cycle-features", action="store_true", help="ridgeにD4(cycle_features.npy)を足さない")
+    p.add_argument("--bootstrap", type=int, default=2000)
 
     p = commands.add_parser("add-cycle-features",
                             help="データセットをコピーし、各splitに忘却因子Dの要約(D4)の cycle_features.npy を足す")
@@ -268,14 +310,19 @@ def main(argv=None) -> int:
                                   trend_catalog_path=args.trend_catalog_path, database_path=args.database_path,
                                   extend_splits=args.extend_splits,
                                   min_months_after_maintenance=args.min_months_after_maintenance,
-                                  maintenance_rule_splits=args.maintenance_rule_splits)
+                                  maintenance_rule_splits=args.maintenance_rule_splits,
+                                  history_months=args.history_months,
+                                  max_months_after_maintenance=args.max_months_after_maintenance,
+                                  **({"splits": tuple(args.splits)} if args.splits else {}),
+                                  normalization_dir=args.normalization_dir)
     elif args.command == "verify":
         import pandas as pd
         from acceleration_forecasting_v2.datasets.verify import verify_dataset_leakage
         manifest = pd.read_csv(Path(args.artifact_dir) / "split_manifest.csv", encoding="utf-8-sig")
         violations = verify_dataset_leakage(args.dataset_dir, manifest, no_synthetic_splits=args.no_synthetic_split,
                                             min_months_after_maintenance=args.min_months_after_maintenance,
-                                            maintenance_rule_splits=args.maintenance_rule_split)
+                                            maintenance_rule_splits=args.maintenance_rule_split,
+                                            max_months_after_maintenance=args.max_months_after_maintenance)
         result = {"violations": violations, "violation_count": len(violations)}
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 1 if violations else 0
@@ -288,6 +335,25 @@ def main(argv=None) -> int:
                        self_target_loss_weight=args.self_target_loss_weight,
                        guide_mix_probability_zero=args.guide_mix_probability_zero,
                        target_mode=args.target_mode, cycle_features=args.cycle_features)
+    elif args.command == "rebuild-guides":
+        from acceleration_forecasting_v2.datasets.history_search_dataset import SPLITS, build_history_search_dataset
+        from acceleration_forecasting_v2.retrieval.search import SearchConfig
+        config = SearchConfig(same_cycle_age=args.same_cycle_age,
+                              cycle_age_fallback_months=args.cycle_age_fallback_months,
+                              max_months_after_maintenance=args.max_months_after_maintenance)
+        result = build_history_search_dataset(
+            args.source_dir, args.artifact_dir, args.output_dir, splits_to_rebuild=tuple(args.splits or SPLITS),
+            search_config=config, search_method=args.search_method, device=args.device,
+            database_path=args.database_path, history_months=args.history_months,
+            trend_catalog_path=args.trend_catalog_path)
+    elif args.command == "evaluate-guide-value":
+        from acceleration_forecasting_v2.evaluation.guide_value import evaluate_guide_value
+        runs = {}
+        for item in args.run:
+            name, _, directory = item.partition("=")
+            runs[name] = directory
+        result = evaluate_guide_value(runs, args.output_dir, baseline=args.baseline, split=args.split,
+                                      use_cycle_features=not args.no_cycle_features, bootstrap=args.bootstrap)
     elif args.command == "add-cycle-features":
         from acceleration_forecasting_v2.datasets.cycle_features import add_cycle_features
         result = add_cycle_features(args.source_dir, args.output_dir, args.trend_catalog_path,

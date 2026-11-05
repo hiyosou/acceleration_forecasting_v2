@@ -24,6 +24,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
+from acceleration_forecasting_v2.common.constants import HISTORY_MONTHS
 from acceleration_forecasting_v2.datasets.self_reference import build_self_target_batch
 from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
 from acceleration_forecasting_v2.diffusion.process import DiffusionProcess
@@ -183,6 +184,12 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         if train_data.cycle_features is None or valid_data.cycle_features is None:
             raise ValueError("--cycle-features にはデータセットの cycle_features.npy が必要です。")
         model_config["cycle_feature_dim"] = cycle_feature_dim
+    # 履歴の長さはデータセットの配列の形から決める(拡張ウィンドウの18か月など、2026-11)。
+    history_months = int(train_data.arrays["history_values"].shape[1])
+    if int(valid_data.arrays["history_values"].shape[1]) != history_months:
+        raise ValueError("model_train と model_validation の履歴の長さが違います。")
+    if history_months != HISTORY_MONTHS:
+        model_config["history_months"] = history_months
     # 新しい設定は既定値のときはキー自体を足さない(既存checkpointのresume時の構成チェックと互換)。
     norms = {"condition_norm": train_data.condition_norm, "target_norm": train_data.target_norm}
     residual = None
@@ -204,7 +211,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         return batch
 
     use_prepare = mixing or residual is not None
-    model = ReferenceModulatedUNetV2(dropout, cycle_feature_dim=cycle_feature_dim).to(device)
+    model = ReferenceModulatedUNetV2(dropout, history_months=history_months,
+                                     cycle_feature_dim=cycle_feature_dim).to(device)
     process = DiffusionProcess(model, diffusion_steps, prediction_type=prediction_type).to(device)
     ema = EMA(model, ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)

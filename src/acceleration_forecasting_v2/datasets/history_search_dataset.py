@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from acceleration_forecasting_v2.common.constants import FORECAST_MONTHS, TOP_K
+from acceleration_forecasting_v2.common.constants import FORECAST_MONTHS, HISTORY_MONTHS, TOP_K
 from acceleration_forecasting_v2.retrieval.database import connect_read_only
 from acceleration_forecasting_v2.retrieval.search import GuideIndex, SearchConfig
 from .build import RawSplit, _build_guide_arrays, fit_condition_and_target_normalization, load_split_arrays, write_split
@@ -106,7 +106,7 @@ def build_history_search_dataset(
     source_dataset_dir, artifact_dir, output_dataset_dir, *,
     splits_to_rebuild=SPLITS, search_config: SearchConfig = SearchConfig(), top_k: int = TOP_K,
     forecast_months: int = FORECAST_MONTHS, temperature: float = 0.1, search_method: str = "history_rmse",
-    device=None, database_path=None,
+    device=None, database_path=None, history_months: int = HISTORY_MONTHS, trend_catalog_path=None,
 ) -> dict:
     """`splits_to_rebuild`で指定した各splitのguideを`search_by_history`で作り直す
     (P3: 学習データ自体を新しい検索方法で作り直す)。
@@ -116,6 +116,10 @@ def build_history_search_dataset(
     search_method: "history_rmse"(既定、6か月の月最大加速度のRMSE)または
         "waveform_history_cosine"(6か月の波形埋め込みのコサイン類似度、
         `retrieval/waveform_history.py`、2026-10-20)。
+    history_months / trend_catalog_path: "waveform_history_cosine"の窓の長さと、そのtrend_catalog
+        (既定は`artifact_dir/trend_catalog.csv`)。`search_config.same_cycle_age`・
+        `max_months_after_maintenance`を使うときは、`cycle_start`列のある延長版のcatalogを指定する(2026-11)。
+        窓の長さは、ソースのデータセットの履歴の長さ(`history_values`の列数)とそろえること。
 
     `splits_to_rebuild`に含まれないsplitは`shutil.copytree`でbyte-identicalにコピー
     するだけ(`pd.read_csv`→`to_csv`の往復はfloat列の桁落ちを起こし得るため使わない
@@ -146,7 +150,8 @@ def build_history_search_dataset(
     waveform_index = None
     if guide_index is not None and search_method == "waveform_history_cosine":
         from acceleration_forecasting_v2.retrieval.waveform_history import build_waveform_history_index
-        waveform_index = build_waveform_history_index(guide_index, artifact_dir, device=device)
+        waveform_index = build_waveform_history_index(guide_index, artifact_dir, device=device,
+                                                      months=history_months, trend_catalog_path=trend_catalog_path)
 
     raw_splits: dict[str, RawSplit] = {}
     rebuilt_counts = {}
