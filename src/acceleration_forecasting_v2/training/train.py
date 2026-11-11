@@ -70,7 +70,7 @@ def dataset_build_id(dataset_dir) -> str:
 
 
 @torch.inference_mode()
-def validation_loss(process, loader, device, seed=42, prepare=None):
+def validation_loss(process, loader, device, seed=42, prepare=None, compute_real_loss=True):
     """検証セット全体でのsegment_weight付き平均損失(と、参考のレコード単位単純平均)を返す。
 
     バッチに`target_synthetic_mask`(忘却因子で延長した正解の印、`datasets.extension`)があるときは、
@@ -82,6 +82,8 @@ def validation_loss(process, loader, device, seed=42, prepare=None):
 
     prepare: 指定時は各バッチに`prepare(batch, generator)`を適用してから損失を計算する
         (混合guide・残差方式。`generator`はnoise/timestepsとは別の、固定seedの乱数)。
+    compute_real_loss: Falseのときは「実測の月だけの損失」(参考値)を計算しない(モデルの通過が1回減る。
+        返す`loss`・`record_loss`は変わらない。2つ目の検証split(`secondary_validation_split`)用)。
     """
     process.model.eval()
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -101,7 +103,7 @@ def validation_loss(process, loader, device, seed=42, prepare=None):
         weight_sum += float(weights.sum())
         record_sum += float(per_record.sum())
         count += size
-        if "target_synthetic_mask" in batch:
+        if compute_real_loss and "target_synthetic_mask" in batch:
             real_mask = batch["target_mask"] * (1 - batch["target_synthetic_mask"])
             real_record = process.per_record_loss({**batch, "target_mask": real_mask}, noise=noise, timesteps=timesteps)
             real_weights = weights * (real_mask.sum(dim=1) > 0)
@@ -120,8 +122,13 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
           dropout=0.1, patience=20, min_delta=1e-4, ema_decay=0.999,
           seed=42, resume=True, progress=True, prediction_type="epsilon",
           diffusion_steps=1000, self_target_loss_weight=0.0, guide_mix_probability_zero=None,
-          target_mode="absolute", cycle_features=False):
+          target_mode="absolute", cycle_features=False, secondary_validation_split=None):
     """RMAを学習する。dataset_dirは`write_dataset`が書き出したディレクトリ。
+
+    secondary_validation_split: 指定すると、そのsplit(例: `model_validation_flatcut`)の検証損失も毎エポック測り、
+        主の検証(model_validation)とは別にbest・stale・checkpointを持つ(`best_model_secondary.pt`)。
+        各系列は自分のpatienceに達した時点で更新をやめ(単独で学習した場合のbestと同じになる)、
+        学習は両方がpatienceに達したときに止める。未指定なら従来の動作と同一。
 
     guide_mix_probability_zero: Noneでなければ、各学習サンプルのguideを
         `λ·正解 + (1−λ)·実guide`に置き換える(確率この値でλ=0、それ以外はλ~U(0,1)。
@@ -162,6 +169,13 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
     build_id = dataset_build_id(dataset_dir)
     train_data = ForecastDatasetV2(dataset_dir / "model_train", dataset_dir)
     valid_data = ForecastDatasetV2(dataset_dir / "model_validation", dataset_dir)
+    secondary = secondary_validation_split is not None
+    if secondary:
+        secondary_data = ForecastDatasetV2(dataset_dir / str(secondary_validation_split), dataset_dir)
+        # DataLoaderはイテレータを作るたびに(generator未指定だと)グローバル乱数を1回消費する。専用のgeneratorを持たせ、
+        # 副の検証があっても学習側の乱数の並びを変えない(主のモデルが単独学習と同一になる)。
+        secondary_loader = DataLoader(secondary_data, batch_size=batch_size, shuffle=False, num_workers=0,
+                                      generator=torch.Generator().manual_seed(seed))
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, generator=generator, num_workers=0)
     valid_loader = DataLoader(valid_data, batch_size=batch_size, shuffle=False, num_workers=0)
@@ -223,6 +237,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
     autocast_dtype = torch.bfloat16 if use_cuda and torch.cuda.is_bf16_supported() else torch.float16
 
     start_epoch, best, stale, history = 0, float("inf"), 0, []
+    best_epoch = 0
+    best2, stale2, best2_epoch = float("inf"), 0, 0
     last_path = output_dir / "last_model.pt"
     if resume and last_path.is_file():
         checkpoint = torch.load(last_path, map_location=device, weights_only=False)
@@ -235,6 +251,13 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         start_epoch = int(checkpoint["epoch"]) + 1
         best = float(checkpoint["best_validation_loss"])
         stale = int(checkpoint.get("stale_epochs", 0))
+        if secondary:
+            if "secondary_best_validation_loss" not in checkpoint:
+                raise ValueError("Checkpoint has no secondary validation state")
+            best_epoch = int(checkpoint["best_epoch"])
+            best2 = float(checkpoint["secondary_best_validation_loss"])
+            stale2 = int(checkpoint["secondary_stale_epochs"])
+            best2_epoch = int(checkpoint["secondary_best_epoch"])
         if (output_dir / "training_history.csv").is_file():
             history = pd.read_csv(output_dir / "training_history.csv").to_dict("records")
 
@@ -289,11 +312,22 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         validation_process = DiffusionProcess(ema.model, diffusion_steps, prediction_type=prediction_type).to(device)
         validation = validation_loss(validation_process, valid_loader, device, seed,
                                      prepare=prepare if use_prepare else None)
-        improved = validation["loss"] < best - min_delta
-        if improved:
-            best, stale = validation["loss"], 0
+        if secondary:
+            # patienceに達した系列は更新をやめる(単独で学習したときのbestと同じにするため)。
+            improved = stale < patience and validation["loss"] < best - min_delta
         else:
+            improved = validation["loss"] < best - min_delta
+        if improved:
+            best, stale, best_epoch = validation["loss"], 0, epoch + 1
+        elif not secondary or stale < patience:
             stale += 1
+        if secondary:
+            validation2 = validation_loss(validation_process, secondary_loader, device, seed, compute_real_loss=False)
+            improved2 = stale2 < patience and validation2["loss"] < best2 - min_delta
+            if improved2:
+                best2, stale2, best2_epoch = validation2["loss"], 0, epoch + 1
+            elif stale2 < patience:
+                stale2 += 1
         history.append({
             "epoch": epoch + 1, "train_loss": train_loss, "validation_loss": validation["loss"],
             "validation_record_loss": validation["record_loss"], "best_validation_loss": best,
@@ -301,6 +335,9 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         })
         if "real_loss" in validation:
             history[-1]["validation_loss_real_months"] = validation["real_loss"]
+        if secondary:
+            history[-1]["validation_loss_secondary"] = validation2["loss"]
+            history[-1]["best_validation_loss_secondary"] = best2
         if mixing:
             history[-1]["validation_loss_lambda0"] = validation_loss(
                 validation_process, valid_loader, device, seed,
@@ -313,13 +350,18 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
             "best_validation_loss": best, "stale_epochs": stale, "dataset_build_id": build_id,
             "model_config": model_config, "seed": seed,
         }
+        if secondary:
+            checkpoint.update({"best_epoch": best_epoch, "secondary_best_validation_loss": best2,
+                               "secondary_stale_epochs": stale2, "secondary_best_epoch": best2_epoch})
         torch.save(checkpoint, last_path)
         if improved:
             torch.save(checkpoint, output_dir / "best_model.pt")
+        if secondary and improved2:
+            torch.save(checkpoint, output_dir / "best_model_secondary.pt")
         scheduler.step()
         if progress:
             epoch_range.set_postfix(train=f"{train_loss:.5f}", valid=f"{validation['loss']:.5f}", best=f"{best:.5f}")
-        if stale >= patience:
+        if stale >= patience and (not secondary or stale2 >= patience):
             break
 
     resolved = {
@@ -328,5 +370,9 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()), "seed": int(seed),
         "training_elapsed_seconds": time.perf_counter() - started,
     }
+    if secondary:
+        resolved["best_epoch"] = best_epoch
+        resolved["secondary_validation"] = {"split": str(secondary_validation_split), "best_validation_loss": best2,
+                                            "best_epoch": best2_epoch}
     (output_dir / "resolved_config.json").write_text(json.dumps(resolved, ensure_ascii=False, indent=2), encoding="utf-8")
     return resolved

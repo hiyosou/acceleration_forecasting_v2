@@ -13,6 +13,7 @@
   screen-features(2026-10-27)
 もある。ふるいで選んだ忘却因子Dの要約(D4)を拡散モデルの条件入力に足すには、データセットに
   add-cycle-features を実行し、train に --cycle-features を渡す。
+学習データの横ばいの件を減らす実験(2026-11)には subsample-flat、train の --secondary-validation-split を使う。
 
 上記のパイプライン段階に加えて、既存成果物の事後検証ツールを6つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
@@ -111,6 +112,9 @@ def _parser():
                    help="residual: 「正解 − (current + guideの変化量の平均)」を生成する")
     p.add_argument("--cycle-features", action="store_true",
                    help="データセットの cycle_features.npy(忘却因子Dの要約8個、add-cycle-features で作る)を条件入力に足す")
+    p.add_argument("--secondary-validation-split",
+                   help="2つ目の検証split(例: model_validation_flatcut)。別のbest(best_model_secondary.pt)を持ち、"
+                        "両方がpatienceに達したら止める")
 
     p = commands.add_parser("rebuild-guides",
                             help="データセットのguideを波形履歴の検索で作り直して別ディレクトリに書き出す")
@@ -151,6 +155,13 @@ def _parser():
     p.add_argument("--trend-catalog-path", required=True, help="全計測を持つ(合成値を含まない)trend_catalog.csv")
     p.add_argument("--normalization-from", help="別のデータセットの cycle_feature_normalization.json を使う場合のそのディレクトリ")
 
+    p = commands.add_parser("subsample-flat",
+                            help="データセットをコピーし、model_trainと検証(b用の model_validation_flatcut)の横ばいの件を減らす")
+    p.add_argument("--source-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--keep-ratio", type=float, required=True, help="横ばいの件を残す割合(0〜1)")
+    p.add_argument("--seed", type=int, default=42)
+
     p = commands.add_parser("predict", help="DDIMで予測(median/p10/p90)")
     p.add_argument("--dataset-dir", required=True)
     p.add_argument("--checkpoint", required=True)
@@ -166,6 +177,9 @@ def _parser():
                         "既定で手前から始める。2026-10-14以前の結果を再現するときは999を指定する")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device")
+    p.add_argument("--reuse-from",
+                   help="別checkpointで作った予測のディレクトリ。設定とEMA重みが完全に同じときだけコピーし、"
+                        "違えば通常どおり予測する(--start-timestepの明示が必要)")
     p.add_argument("--guide-mode", choices=("retrieved", "self_target"), default="retrieved",
                    help="self_targetは生成モジュールの上限性能(天井)を測る診断モード:"
                         "検索guideの代わりに各レコード自身の正解を全DDIMステップに渡す"
@@ -274,6 +288,8 @@ def _parser():
     p.add_argument("--trend-id", action="append", required=True, help="描画するレコード。複数指定可")
     p.add_argument("--model-label", default="拡散モデル", help="拡散モデルの図のタイトル末尾に付ける名前")
     p.add_argument("--lambdas", type=float, nargs="+", help="忘却係数(既定 1.00〜0.90 の0.01刻み)")
+    p.add_argument("--file-suffix", default="",
+                   help="図のファイル名の末尾(diffusion{suffix}.png / forgetting{suffix}.png)。複数モデルを同じフォルダに並べるとき用")
     p.add_argument("--bin-width", type=float, default=0.1)
     p.add_argument("--dpi", type=int, default=150)
 
@@ -334,7 +350,8 @@ def main(argv=None) -> int:
                        prediction_type=args.prediction_type,
                        self_target_loss_weight=args.self_target_loss_weight,
                        guide_mix_probability_zero=args.guide_mix_probability_zero,
-                       target_mode=args.target_mode, cycle_features=args.cycle_features)
+                       target_mode=args.target_mode, cycle_features=args.cycle_features,
+                       secondary_validation_split=args.secondary_validation_split)
     elif args.command == "rebuild-guides":
         from acceleration_forecasting_v2.datasets.history_search_dataset import SPLITS, build_history_search_dataset
         from acceleration_forecasting_v2.retrieval.search import SearchConfig
@@ -358,9 +375,21 @@ def main(argv=None) -> int:
         from acceleration_forecasting_v2.datasets.cycle_features import add_cycle_features
         result = add_cycle_features(args.source_dir, args.output_dir, args.trend_catalog_path,
                                     normalization_from=args.normalization_from)
+    elif args.command == "subsample-flat":
+        from acceleration_forecasting_v2.datasets.flat_subsample import subsample_flat
+        result = subsample_flat(args.source_dir, args.output_dir, args.keep_ratio, seed=args.seed)
     elif args.command == "predict":
-        from acceleration_forecasting_v2.inference.predict import predict
-        result = predict(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split, device=args.device,
+        from acceleration_forecasting_v2.inference.predict import predict, reuse_prediction
+        result = None
+        if args.reuse_from:
+            from acceleration_forecasting_v2.datasets.torch_dataset import ForecastDatasetV2
+            dataset_dir = Path(args.dataset_dir)
+            result = reuse_prediction(
+                args.reuse_from, args.checkpoint, args.output_dir, split=args.split, device=args.device,
+                num_samples=args.num_samples, sampling_steps=args.sampling_steps, seed=args.seed,
+                batch_size=args.batch_size, guide_mode=args.guide_mode, start_timestep=args.start_timestep,
+                dataset_size=len(ForecastDatasetV2(dataset_dir / args.split, dataset_dir, include_targets=False)))
+        result = result or predict(args.dataset_dir, args.checkpoint, args.output_dir, split=args.split, device=args.device,
                          num_samples=args.num_samples, sampling_steps=args.sampling_steps, seed=args.seed,
                          batch_size=args.batch_size,
                          guide_mode=args.guide_mode, start_timestep=args.start_timestep)
@@ -421,7 +450,8 @@ def main(argv=None) -> int:
         from acceleration_forecasting_v2.evaluation.visualize import plot_prediction_pair
         result = plot_prediction_pair(args.dataset_dir, args.prediction_dir, args.artifact_dir, args.output_dir,
                                       trend_ids=args.trend_id, split=args.split, model_label=args.model_label,
-                                      lambdas=args.lambdas, bin_width=args.bin_width, dpi=args.dpi)
+                                      lambdas=args.lambdas, bin_width=args.bin_width, dpi=args.dpi,
+                                      file_suffix=args.file_suffix)
     elif args.command == "evaluate-guide-fidelity":
         from acceleration_forecasting_v2.evaluation.evaluate import evaluate_guide_fidelity
         result = evaluate_guide_fidelity(args.dataset_dir, args.prediction_dir, args.output_dir, split=args.split)

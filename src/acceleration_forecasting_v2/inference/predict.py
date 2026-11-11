@@ -145,3 +145,52 @@ def predict(dataset_dir, checkpoint_path, output_dir, *, split="inference", devi
     }
     (output_dir / "prediction_run.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def _same_weights(path_a, path_b) -> bool:
+    """2つのcheckpointが、予測に使う重み(EMA)とモデル設定まで完全に同じか(全テンソルで`torch.equal`)。"""
+    a = torch.load(path_a, map_location="cpu", weights_only=False)
+    b = torch.load(path_b, map_location="cpu", weights_only=False)
+    if a["model_config"] != b["model_config"]:
+        return False
+    state_a, state_b = a["ema_state_dict"], b["ema_state_dict"]
+    return list(state_a) == list(state_b) and all(torch.equal(state_a[key], state_b[key]) for key in state_a)
+
+
+def reuse_prediction(reuse_dir, checkpoint_path, output_dir, *, split="inference", device=None, num_samples=100,
+                     sampling_steps=50, eta=0.0, batch_size=8, seed=42, use_ema=True,
+                     bounds=(PHYSICAL_MIN, PHYSICAL_MAX), guide_mode="retrieved", start_timestep=None,
+                     dataset_size=None):
+    """別checkpointで作った予測(`reuse_dir`)が、`checkpoint_path`でも完全に同じになるときだけ、そのままコピーする。
+
+    条件(全て満たすときだけコピー。満たさなければNoneを返し、呼び出し側が通常の`predict`を実行する):
+    - `reuse_dir/prediction_run.json`の設定(split・サンプル数・ステップ数・eta・seed・batch_size・start_timestep・
+      bounds・use_ema・guide_mode・混合精度・件数)が今回の指定と一致する(start_timestepは明示が必要)。
+    - 元のcheckpointと`checkpoint_path`のEMA重み・モデル設定が全テンソルで一致する(`_same_weights`)。
+    コピーするのは`samples.npz`と`predictions.csv`(バイト単位)。`prediction_run.json`は`predict`と同じ
+    書き方で、`checkpoint`だけ`checkpoint_path`にして書く。戻り値は`predict`のサマリdictと同じ。
+    """
+    reuse_dir, output_dir = Path(reuse_dir), Path(output_dir)
+    run_path = reuse_dir / "prediction_run.json"
+    if start_timestep is None or not all((reuse_dir / name).is_file()
+                                         for name in ("samples.npz", "predictions.csv", "prediction_run.json")):
+        return None
+    summary = json.loads(run_path.read_text(encoding="utf-8"))
+    resolved_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    expected = {"split": split, "num_samples": int(num_samples), "sampling_steps": int(sampling_steps),
+                "eta": float(eta), "seed": int(seed), "batch_size": int(batch_size),
+                "start_timestep": int(start_timestep), "bounds": [float(bounds[0]), float(bounds[1])],
+                "use_ema": bool(use_ema), "mixed_precision": resolved_device.type == "cuda",
+                "guide_mode": guide_mode}
+    if dataset_size is not None:
+        expected["record_count"] = int(dataset_size)
+    if any(summary.get(key) != value for key, value in expected.items()):
+        return None
+    if not _same_weights(summary["checkpoint"], checkpoint_path):
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("predictions.csv", "samples.npz"):
+        (output_dir / name).write_bytes((reuse_dir / name).read_bytes())
+    summary["checkpoint"] = str(checkpoint_path)
+    (output_dir / "prediction_run.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary

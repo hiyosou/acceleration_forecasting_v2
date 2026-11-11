@@ -728,8 +728,11 @@ def plot_prediction_batch(dataset_dir, artifact_dir, output_dir, methods: dict, 
 
 
 def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, *, trend_ids, split="inference",
-                         model_label="拡散モデル", lambdas=None, bin_width=0.1, dpi=150) -> dict:
+                         model_label="拡散モデル", lambdas=None, bin_width=0.1, dpi=150, file_suffix="") -> dict:
     """指定レコードごとに、拡散モデルの予測図と忘却因子付き線形近似の図を別々に書き出す(2026-10-22)。
+
+    file_suffix: ファイル名の末尾に足す文字列(`diffusion{suffix}.png`・`forgetting{suffix}.png`)。複数のモデルの図を
+        同じフォルダに並べるときに使う。既定の空文字なら従来のファイル名。
 
     ユーザーとの取り決め: 拡散モデルの推論結果を示すときは、同じレコードの忘却因子の予測も
     別の図で並べる。どちらの図も`plot_prediction`と同じ書式(透明背景・施工線・予測起点/開始)で、
@@ -794,7 +797,7 @@ def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, 
         folders_seen[folder] = trend_id
         samples = _load_samples_for_trend_id(prediction_dir, trend_id)
 
-        diffusion_path = output_dir / folder / "diffusion.png"
+        diffusion_path = output_dir / folder / f"diffusion{file_suffix}.png"
         plot_prediction_record(
             diffusion_path, trend_id=trend_id, dataset_id=row["dataset_id"], direction=direction,
             bin_start_m=bin_start_m, bin_end_m=bin_end_m, anchor_date=anchor, current_value=current_value,
@@ -805,7 +808,7 @@ def plot_prediction_pair(dataset_dir, prediction_dir, artifact_dir, output_dir, 
             measurement_history=measurement_history, show_target=False, measurement_alpha=1.0,
             title_suffix=model_label, maintenance_from=maintenance_from,
         )
-        forgetting_path = output_dir / folder / "forgetting.png"
+        forgetting_path = output_dir / folder / f"forgetting{file_suffix}.png"
         plot_forgetting_factor_record(
             forgetting_path, trend_id=trend_id, direction=direction, bin_start_m=bin_start_m, bin_end_m=bin_end_m,
             anchor_date=anchor, current_value=current_value, input_dates=cycle["measurement_date"],
