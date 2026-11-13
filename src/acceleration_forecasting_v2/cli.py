@@ -14,6 +14,7 @@
 もある。ふるいで選んだ忘却因子Dの要約(D4)を拡散モデルの条件入力に足すには、データセットに
   add-cycle-features を実行し、train に --cycle-features を渡す。
 学習データの横ばいの件を減らす実験(2026-11)には subsample-flat、train の --secondary-validation-split を使う。
+損失に変化量・傾きの補助項を足す実験(2026-11)には train の --slope-loss-weight を使う。
 
 上記のパイプライン段階に加えて、既存成果物の事後検証ツールを6つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
@@ -112,6 +113,8 @@ def _parser():
                    help="residual: 「正解 − (current + guideの変化量の平均)」を生成する")
     p.add_argument("--cycle-features", action="store_true",
                    help="データセットの cycle_features.npy(忘却因子Dの要約8個、add-cycle-features で作る)を条件入力に足す")
+    p.add_argument("--slope-loss-weight", type=float, default=0.0,
+                   help="0より大きいと、εのMSEに変化量・傾きの補助項をこの重みで足す(epsilon専用、既定0.0で従来と同一)")
     p.add_argument("--secondary-validation-split",
                    help="2つ目の検証split(例: model_validation_flatcut)。別のbest(best_model_secondary.pt)を持ち、"
                         "両方がpatienceに達したら止める")
@@ -351,7 +354,8 @@ def main(argv=None) -> int:
                        self_target_loss_weight=args.self_target_loss_weight,
                        guide_mix_probability_zero=args.guide_mix_probability_zero,
                        target_mode=args.target_mode, cycle_features=args.cycle_features,
-                       secondary_validation_split=args.secondary_validation_split)
+                       secondary_validation_split=args.secondary_validation_split,
+                       slope_loss_weight=args.slope_loss_weight)
     elif args.command == "rebuild-guides":
         from acceleration_forecasting_v2.datasets.history_search_dataset import SPLITS, build_history_search_dataset
         from acceleration_forecasting_v2.retrieval.search import SearchConfig

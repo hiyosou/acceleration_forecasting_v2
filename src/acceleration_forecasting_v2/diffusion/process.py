@@ -34,6 +34,27 @@ def cosine_alpha_bars(steps=1000, offset=0.008):
     return torch.cumprod(1 - betas, dim=0).float()
 
 
+def _slope_term(predicted, noise, mask, alpha):
+    """変化量(最後の有効3か月の平均)と傾き(隣り合う有効な月の差)の二乗誤差。float32で計算する。
+
+    x̂0 − x0 = −sqrt(1−ᾱ)/sqrt(ᾱ)·(ε̂ − ε) なので、ᾱ·(x̂0 − x0)の2乗は (1−ᾱ)·(ε̂ − ε)の2乗になる。
+    誤差eの線形結合だけで書けるので、x̂0そのものは作らない(tが大きくても割り算で値が暴れない)。
+    """
+    error = (predicted.float() - noise.float()) * (1 - alpha.float()).sqrt()
+    mask = mask.float()
+    # 最後の有効3か月: 後ろから数えた有効月の通し番号が1〜3のもの。
+    rank_from_end = mask.flip(1).cumsum(dim=1).flip(1)
+    last3 = mask * (rank_from_end <= 3).float()
+    count3 = last3.sum(dim=1)
+    mean_error = (error * last3).sum(dim=1) / count3.clamp_min(1)
+    level = mean_error.square() * (count3 > 0).float()
+    pair = mask[:, 1:] * mask[:, :-1]
+    diff_error = (error[:, 1:] - error[:, :-1]) * pair
+    pairs = pair.sum(dim=1)
+    shape = diff_error.square().sum(dim=1) / pairs.clamp_min(1)
+    return level + shape
+
+
 class DiffusionProcess:
     """cosineスケジュールの拡散プロセス。prediction_typeはepsilon/v_prediction/x0_predictionに対応。"""
 
@@ -55,6 +76,20 @@ class DiffusionProcess:
         セグメント単位の重み付け(SPEC 1.1)は含まない — 呼び出し側
         (`training/loss.py`)がこれを`segment_weight`と組み合わせて集約する。
         """
+        return self._per_record_terms(batch, noise, timesteps)[0]
+
+    def per_record_loss_with_slope(self, batch, noise=None, timesteps=None):
+        """(マスク付きMSE, 変化量・傾きの補助項)をレコード単位で返す(それぞれshape: (batch,))。
+
+        補助項(2026-11、案A): 予測したεから正解の推定値 x̂0 = (x_t − sqrt(1−ᾱ)·ε̂)/sqrt(ᾱ) を作り、
+        「最後の有効3か月の平均」と「隣り合う有効な月の差」を本物の正解と比べる。ᾱ_tを掛けて
+        ノイズの大きいtほど重く、t→0でも有限にする(ᾱ·(x̂0−x0)² = (1−ᾱ)·(ε̂−ε)²)。epsilon専用。
+        """
+        if self.prediction_type != "epsilon":
+            raise ValueError("変化量・傾きの補助項はepsilon予測でだけ使えます")
+        return self._per_record_terms(batch, noise, timesteps, slope=True)
+
+    def _per_record_terms(self, batch, noise, timesteps, slope=False):
         target, mask = batch["target"], batch["target_mask"]
         batch_size = target.shape[0]
         timesteps = timesteps if timesteps is not None else torch.randint(0, self.steps, (batch_size,), device=target.device)
@@ -70,7 +105,9 @@ class DiffusionProcess:
         predicted = self.model(noisy, timesteps, batch)
         squared = (predicted - expected).square() * mask
         per_record = squared.sum(dim=1) / mask.sum(dim=1).clamp_min(1)
-        return per_record
+        if not slope:
+            return per_record, None
+        return per_record, _slope_term(predicted, noise, mask, alpha)
 
     def diagnostics(self, batch, noise=None, timesteps=None):
         """学習曲線の監視用に、正規化空間でのx0 MAE/RMSEなど補助指標も返す。"""

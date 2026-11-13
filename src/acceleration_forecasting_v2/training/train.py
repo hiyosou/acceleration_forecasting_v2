@@ -122,13 +122,20 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
           dropout=0.1, patience=20, min_delta=1e-4, ema_decay=0.999,
           seed=42, resume=True, progress=True, prediction_type="epsilon",
           diffusion_steps=1000, self_target_loss_weight=0.0, guide_mix_probability_zero=None,
-          target_mode="absolute", cycle_features=False, secondary_validation_split=None):
+          target_mode="absolute", cycle_features=False, secondary_validation_split=None,
+          slope_loss_weight=0.0):
     """RMAを学習する。dataset_dirは`write_dataset`が書き出したディレクトリ。
 
     secondary_validation_split: 指定すると、そのsplit(例: `model_validation_flatcut`)の検証損失も毎エポック測り、
         主の検証(model_validation)とは別にbest・stale・checkpointを持つ(`best_model_secondary.pt`)。
         各系列は自分のpatienceに達した時点で更新をやめ(単独で学習した場合のbestと同じになる)、
         学習は両方がpatienceに達したときに止める。未指定なら従来の動作と同一。
+
+    slope_loss_weight: 0より大きいと、εのMSEに「変化量・傾きの補助項」(`DiffusionProcess.per_record_loss_with_slope`、
+        予測から作った正解の推定の最後の有効3か月の平均と、隣り合う有効な月の差の二乗誤差)をこの重みで加える
+        (2026-11、案A)。validation_loss・best選定には含めない(εのMSEだけ)。epsilon専用で、混合guide・残差方式・
+        self_target_loss_weightとは併用できない。未指定(0.0)なら従来の動作と同一。
+        training_historyの`train_slope_loss`は補助項そのもの(重みを掛ける前)の重みつき平均。
 
     guide_mix_probability_zero: Noneでなければ、各学習サンプルのguideを
         `λ·正解 + (1−λ)·実guide`に置き換える(確率この値でλ=0、それ以外はλ~U(0,1)。
@@ -163,6 +170,11 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         raise ValueError("guide_mix_probability_zero must be between 0 and 1")
     if (mixing or target_mode != "absolute") and float(self_target_loss_weight) > 0:
         raise ValueError("self_target_loss_weightは混合guide・残差方式と併用できません")
+    if float(slope_loss_weight) < 0:
+        raise ValueError("slope_loss_weight must be non-negative")
+    if float(slope_loss_weight) > 0 and (mixing or target_mode != "absolute" or float(self_target_loss_weight) > 0
+                                         or prediction_type != "epsilon"):
+        raise ValueError("slope_loss_weightはepsilon予測のabsoluteで、混合guide・self_target_loss_weightなしのときだけ使えます")
     torch.manual_seed(seed)
     dataset_dir, output_dir = Path(dataset_dir).resolve(), Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +193,7 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
     valid_loader = DataLoader(valid_data, batch_size=batch_size, shuffle=False, num_workers=0)
     device = _device(device)
     self_target_loss_weight = float(self_target_loss_weight)
+    slope_loss_weight = float(slope_loss_weight)
     current_values = None
     if self_target_loss_weight > 0:
         # model_train/metadata.csvの行順は配列(.npy)の行順と一致する(datasets/build.pyで
@@ -193,6 +206,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
     model_config = {"dropout": float(dropout), "forecast_months": 12, "target_mode": target_mode,
                     "prediction_type": prediction_type, "diffusion_steps": int(diffusion_steps),
                     "self_target_loss_weight": self_target_loss_weight}
+    if slope_loss_weight > 0:
+        model_config["slope_loss_weight"] = slope_loss_weight
     cycle_feature_dim = FEATURE_DIM if cycle_features else 0
     if cycle_features:
         if train_data.cycle_features is None or valid_data.cycle_features is None:
@@ -272,6 +287,7 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         model.train()
         optimizer.zero_grad(set_to_none=True)
         weighted_sum, weight_sum, batches = 0.0, 0.0, 0
+        slope_sum = 0.0
         for batch_index, batch in enumerate(train_loader):
             batch = _move(batch, device)
             if use_prepare:
@@ -286,7 +302,11 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
             timesteps = torch.randint(0, process.steps, (batch_size,), device=device)
             noise = torch.randn_like(batch["target"])
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_cuda):
-                per_record = process.per_record_loss(batch, noise=noise, timesteps=timesteps)
+                if slope_loss_weight > 0:
+                    per_record, slope_term = process.per_record_loss_with_slope(batch, noise=noise, timesteps=timesteps)
+                    per_record = per_record + slope_loss_weight * slope_term
+                else:
+                    per_record = process.per_record_loss(batch, noise=noise, timesteps=timesteps)
                 if self_target_loss_weight > 0:
                     positions = batch["index"].cpu().numpy()
                     self_target_batch = build_self_target_batch(train_data, batch, current_values[positions])
@@ -304,6 +324,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
                 optimizer.zero_grad(set_to_none=True)
                 ema.update(model)
             weights = batch["segment_weight"]
+            if slope_loss_weight > 0:
+                slope_sum += float((weights * slope_term.detach().float()).sum())
             weighted_sum += float((weights * per_record.detach().float()).sum())
             weight_sum += float(weights.sum())
             batches += 1
@@ -335,6 +357,8 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         })
         if "real_loss" in validation:
             history[-1]["validation_loss_real_months"] = validation["real_loss"]
+        if slope_loss_weight > 0:
+            history[-1]["train_slope_loss"] = slope_sum / max(weight_sum, 1e-12)
         if secondary:
             history[-1]["validation_loss_secondary"] = validation2["loss"]
             history[-1]["best_validation_loss_secondary"] = best2
