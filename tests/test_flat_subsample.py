@@ -12,7 +12,7 @@ from test_training import _raw_split, _train_kwargs
 from acceleration_forecasting_v2.cli import main
 from acceleration_forecasting_v2.datasets.build import RawSplit, write_dataset
 from acceleration_forecasting_v2.datasets.flat_subsample import (
-    VALIDATION_FLATCUT_SPLIT, categorize, change_amounts, flat_keep_mask, subsample_flat,
+    VALIDATION_FLATCUT_SPLIT, categorize, change_amounts, flat_keep_mask, is_flat, subsample_flat,
 )
 from acceleration_forecasting_v2.inference.predict import predict, reuse_prediction
 from acceleration_forecasting_v2.training.train import train
@@ -111,6 +111,35 @@ def test_subsample_rows_stay_aligned_and_weights_and_normalization_are_untouched
 def test_subsample_flat_cli(source, tmp_path, capsys):
     assert main(["subsample-flat", "--source-dir", str(source), "--output-dir", str(tmp_path / "o"), "--keep-ratio", "0.2"]) == 0
     assert json.loads(capsys.readouterr().out)["keep_ratio"] == 0.2
+
+
+# --- Δ<0.5 を横ばいとする規則(below05) -----------------------------------------------------------------
+def test_below05_rule_flags_everything_under_the_rise_threshold(source):
+    assert is_flat([np.nan, -1.0, 0.0, 0.2, 0.499, 0.5, 0.8], "below05").tolist() == [False, True, True, True, True, False, False]
+    assert is_flat([np.nan, 0.19, 0.2, -0.2], "abs02").tolist() == [False, True, False, False]
+    with pytest.raises(ValueError):
+        is_flat([0.0], "nope")
+
+
+def test_below05_keeps_only_rises_at_zero_and_nests(source, tmp_path):
+    zero = subsample_flat(source, tmp_path / "r0", 0.0, flat_rule="below05")
+    train = zero["splits"]["model_train"]
+    assert zero["flat_rule"] == "below05"
+    assert train["records_after"] == train["categories_after"]["大きく上昇"] == 3 * 10
+    assert train["flat_fraction_after"] == 0.0 and train["flat_fraction_before"] == 0.75
+    subsample_flat(source, tmp_path / "r3", 0.3, flat_rule="below05")
+    ids = {name: set(pd.read_csv(tmp_path / name / "model_train" / "metadata.csv", encoding="utf-8-sig")["trend_id"])
+           for name in ("r0", "r3")}
+    assert ids["r0"] < ids["r3"]
+    assert len(ids["r3"]) == 3 * (10 + 9)  # 横ばい30件のうち round(0.3×30)=9件
+    with pytest.raises(ValueError):
+        subsample_flat(source, tmp_path / "bad", 0.5, flat_rule="nope")
+
+
+def test_default_rule_summary_has_no_flat_rule_key(source, tmp_path):
+    assert "flat_rule" not in subsample_flat(source, tmp_path / "d", 0.5)
+    assert main(["subsample-flat", "--source-dir", str(source), "--output-dir", str(tmp_path / "c"),
+                 "--keep-ratio", "0", "--flat-rule", "below05"]) == 0
 
 
 # --- 副の検証 ---------------------------------------------------------------------------------------

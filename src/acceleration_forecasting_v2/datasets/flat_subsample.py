@@ -23,6 +23,8 @@ VALIDATION_SPLIT = "model_validation"
 VALIDATION_FLATCUT_SPLIT = "model_validation_flatcut"
 SUMMARY_FILE = "flat_subsample_summary.json"
 CATEGORIES = ("下降", "横ばい", "小さく上昇", "大きく上昇")
+# 削る対象とする「横ばい」の規則。abs02: |Δ|<0.2(既定)。below05: Δ<0.5(下降・小さな上昇も含む。大きく上昇の補集合)
+FLAT_RULES = ("abs02", "below05")
 
 
 def change_amounts(split_dir, metadata=None) -> np.ndarray:
@@ -56,6 +58,16 @@ def categorize(delta) -> np.ndarray:
     return category
 
 
+def is_flat(delta, rule="abs02") -> np.ndarray:
+    """削る対象(横ばい)の行。NaN(有効な月が無い行)はどの規則でも横ばいに数えない。"""
+    if rule not in FLAT_RULES:
+        raise ValueError(f"flat_rule must be one of {FLAT_RULES}, got {rule!r}")
+    delta = np.asarray(delta, dtype=float)
+    if rule == "abs02":
+        return categorize(delta) == 1
+    return np.isfinite(delta) & (delta < RISE_THRESHOLD)
+
+
 def flat_keep_mask(dataset_ids, is_flat, keep_ratio, seed=42) -> np.ndarray:
     """残す行のブール配列。横ばいでない行は全て残し、横ばいの行はセグメントごとに round(r×件数) 件残す。
 
@@ -84,7 +96,7 @@ def _write_subset(source_split, output_split, keep) -> None:
     metadata.iloc[rows].to_csv(output_split / "metadata.csv", index=False, encoding="utf-8-sig")
 
 
-def _split_summary(split_dir, keep, weights) -> dict:
+def _split_summary(split_dir, keep, weights, flat_rule="abs02") -> dict:
     delta = change_amounts(split_dir)
     category = categorize(delta)
     kept = category[keep]
@@ -92,7 +104,7 @@ def _split_summary(split_dir, keep, weights) -> dict:
     def count(values):
         return {name: int((values == index).sum()) for index, name in enumerate(CATEGORIES)}
 
-    flat = category == 1
+    flat = is_flat(delta, flat_rule)
     return {
         "records_before": int(len(keep)), "records_after": int(keep.sum()),
         "categories_before": count(category), "categories_after": count(kept),
@@ -102,8 +114,10 @@ def _split_summary(split_dir, keep, weights) -> dict:
     }
 
 
-def subsample_flat(source_dir, output_dir, keep_ratio, seed=42) -> dict:
+def subsample_flat(source_dir, output_dir, keep_ratio, seed=42, flat_rule="abs02") -> dict:
     """`source_dir`の横ばいの件を減らしたデータセットを`output_dir`に作る(元は変更しない)。"""
+    if flat_rule not in FLAT_RULES:
+        raise ValueError(f"flat_rule must be one of {FLAT_RULES}, got {flat_rule!r}")
     source_dir, output_dir = Path(source_dir), Path(output_dir)
     if output_dir.exists():
         raise FileExistsError(f"{output_dir} は既にあります。")
@@ -112,15 +126,17 @@ def subsample_flat(source_dir, output_dir, keep_ratio, seed=42) -> dict:
         if path.is_file():
             shutil.copy2(path, output_dir / path.name)
     summary = {"keep_ratio": float(keep_ratio), "seed": int(seed), "splits": {}}
+    if flat_rule != "abs02":
+        summary["flat_rule"] = flat_rule
     plan = ((TRAIN_SPLIT, TRAIN_SPLIT, keep_ratio), (VALIDATION_SPLIT, VALIDATION_SPLIT, 1.0),
             (VALIDATION_SPLIT, VALIDATION_FLATCUT_SPLIT, keep_ratio))
     for source_name, output_name, ratio in plan:
         source_split = source_dir / source_name
         metadata = pd.read_csv(source_split / "metadata.csv", encoding="utf-8-sig")
-        is_flat = categorize(change_amounts(source_split, metadata)) == 1
-        keep = flat_keep_mask(metadata["dataset_id"], is_flat, ratio, seed)
+        flat = is_flat(change_amounts(source_split, metadata), flat_rule)
+        keep = flat_keep_mask(metadata["dataset_id"], flat, ratio, seed)
         _write_subset(source_split, output_dir / output_name, keep)
         weights = np.load(source_split / "segment_weights.npy").astype(float)
-        summary["splits"][output_name] = _split_summary(source_split, keep, weights)
+        summary["splits"][output_name] = _split_summary(source_split, keep, weights, flat_rule)
     (output_dir / SUMMARY_FILE).write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary

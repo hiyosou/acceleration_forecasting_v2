@@ -163,6 +163,8 @@ def _parser():
     p.add_argument("--source-dir", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--keep-ratio", type=float, required=True, help="横ばいの件を残す割合(0〜1)")
+    p.add_argument("--flat-rule", choices=("abs02", "below05"), default="abs02",
+                   help="横ばいの規則。abs02=|Δ|<0.2(既定)、below05=Δ<0.5(下降も含めて削る)")
     p.add_argument("--seed", type=int, default=42)
 
     p = commands.add_parser("predict", help="DDIMで予測(median/p10/p90)")
@@ -381,7 +383,8 @@ def main(argv=None) -> int:
                                     normalization_from=args.normalization_from)
     elif args.command == "subsample-flat":
         from acceleration_forecasting_v2.datasets.flat_subsample import subsample_flat
-        result = subsample_flat(args.source_dir, args.output_dir, args.keep_ratio, seed=args.seed)
+        result = subsample_flat(args.source_dir, args.output_dir, args.keep_ratio, seed=args.seed,
+                                flat_rule=args.flat_rule)
     elif args.command == "predict":
         from acceleration_forecasting_v2.inference.predict import predict, reuse_prediction
         result = None
