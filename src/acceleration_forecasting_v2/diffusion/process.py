@@ -176,3 +176,36 @@ class DiffusionProcess:
             random = torch.randn(values.shape, device=device, generator=generator) if next_timestep >= 0 else 0
             values = next_alpha.sqrt() * predicted_clean + direction + sigma * random
         return values
+
+    def ddim_differentiable(self, batch, *, shape, sampling_steps=4, normalized_clip=None, start_timestep=None, noise=None):
+        """勾配が流れるDDIM(eta=0のみ)。`ddim`と同じ計算を`inference_mode`なしで行う(2026-11、案B: energy score)。
+
+        noise: 初期ノイズ(shapeと同じ形)。サンプルごとに呼び出し側が与える(None不可)。全ステップを通して
+        モデルへ勾配が流れる。`ddim`は変更しない。dtype・autocastは呼び出し側が決める。
+        """
+        if noise is None or tuple(noise.shape) != tuple(shape):
+            raise ValueError("noise must be given with the same shape as `shape`")
+        if int(sampling_steps) <= 0 or int(sampling_steps) > self.steps:
+            raise ValueError("sampling_steps must be between 1 and diffusion steps")
+        start = min(DEFAULT_START_TIMESTEP, self.steps - 1) if start_timestep is None else int(start_timestep)
+        if start < 0 or start > self.steps - 1:
+            raise ValueError("start_timestep must be between 0 and diffusion steps - 1")
+        if int(sampling_steps) > start + 1:
+            raise ValueError("sampling_steps must not exceed start_timestep + 1")
+        device = noise.device
+        values = noise
+        sequence = np.linspace(start, 0, int(sampling_steps), dtype=int)
+        for position, timestep in enumerate(sequence):
+            next_timestep = sequence[position + 1] if position + 1 < len(sequence) else -1
+            t = torch.full((shape[0],), int(timestep), device=device, dtype=torch.long)
+            alpha = self.alpha_bars[int(timestep)]
+            next_alpha = self.alpha_bars[int(next_timestep)] if next_timestep >= 0 else torch.tensor(1.0, device=device)
+            output = self.model(values, t, batch)
+            predicted_clean, epsilon = self.model_output_to_x0_epsilon(values, output, alpha)
+            if normalized_clip is not None:
+                low, high = (bound.to(predicted_clean.dtype) if torch.is_tensor(bound) else float(bound)
+                             for bound in normalized_clip)
+                predicted_clean = predicted_clean.clamp(low, high)
+            direction = torch.sqrt(torch.clamp(1 - next_alpha, min=0)) * epsilon
+            values = next_alpha.sqrt() * predicted_clean + direction
+        return values

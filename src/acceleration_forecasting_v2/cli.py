@@ -15,6 +15,7 @@
   add-cycle-features を実行し、train に --cycle-features を渡す。
 学習データの横ばいの件を減らす実験(2026-11)には subsample-flat、train の --secondary-validation-split を使う。
 損失に変化量・傾きの補助項を足す実験(2026-11)には train の --slope-loss-weight を使う。
+予測サンプルのenergy scoreで学習済みモデルを微調整する実験(2026-11、案B)には finetune-energy を使う。
 
 上記のパイプライン段階に加えて、既存成果物の事後検証ツールを6つ持つ(いずれもSPEC.mdの
 パイプライン段階ではなく、既にある成果物が正しいかを確認する診断コマンド):
@@ -118,6 +119,25 @@ def _parser():
     p.add_argument("--secondary-validation-split",
                    help="2つ目の検証split(例: model_validation_flatcut)。別のbest(best_model_secondary.pt)を持ち、"
                         "両方がpatienceに達したら止める")
+
+    p = commands.add_parser("finetune-energy",
+                            help="学習済みcheckpoint(EMA重み)を、予測サンプルのenergy scoreを損失に足して微調整する(案B)")
+    p.add_argument("--dataset-dir", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--init-checkpoint", required=True, help="初期値(EMA重みをmodelとEMAの両方に入れる)")
+    p.add_argument("--energy-weight", type=float, required=True, help="γ。0ならESを足さない対照(同じ手順・同じbest選定)")
+    p.add_argument("--energy-batch", type=int, default=16, help="各マイクロバッチのうちESを計算する先頭の件数")
+    p.add_argument("--energy-samples", type=int, default=4, help="1件あたりのサンプル数K")
+    p.add_argument("--energy-steps", type=int, default=4, help="微分可能なDDIMのステップ数")
+    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--max-epochs", type=int, default=20)
+    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--validation-records", type=int, default=512)
+    p.add_argument("--validation-samples", type=int, default=8)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device")
+    p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--no-progress", action="store_true")
 
     p = commands.add_parser("rebuild-guides",
                             help="データセットのguideを波形履歴の検索で作り直して別ディレクトリに書き出す")
@@ -358,6 +378,15 @@ def main(argv=None) -> int:
                        target_mode=args.target_mode, cycle_features=args.cycle_features,
                        secondary_validation_split=args.secondary_validation_split,
                        slope_loss_weight=args.slope_loss_weight)
+    elif args.command == "finetune-energy":
+        from acceleration_forecasting_v2.training.energy import finetune_energy
+        result = finetune_energy(args.dataset_dir, args.output_dir, init_checkpoint=args.init_checkpoint,
+                                 energy_weight=args.energy_weight, energy_batch=args.energy_batch,
+                                 energy_samples=args.energy_samples, energy_steps=args.energy_steps,
+                                 learning_rate=args.learning_rate, max_epochs=args.max_epochs,
+                                 patience=args.patience, validation_records=args.validation_records,
+                                 validation_samples=args.validation_samples, seed=args.seed, device=args.device,
+                                 resume=not args.no_resume, progress=not args.no_progress)
     elif args.command == "rebuild-guides":
         from acceleration_forecasting_v2.datasets.history_search_dataset import SPLITS, build_history_search_dataset
         from acceleration_forecasting_v2.retrieval.search import SearchConfig
