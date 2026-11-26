@@ -51,6 +51,7 @@ def test_dataset_item_keys_and_shapes(tmp_path):
     assert set(item.keys()) == {
         "history_values", "history_masks", "guide_values", "guide_deltas", "guide_mask",
         "guide_similarities", "retrieval_mask", "segment_weight", "index", "target", "target_mask",
+        "delta_target", "delta_mask",  # 変化量Δの補助損失用(2026-11)。使わなければ学習に影響しない
     }
     assert item["history_values"].shape == (6,)
     assert item["guide_values"].shape == (3, 12)

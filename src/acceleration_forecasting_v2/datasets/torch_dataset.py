@@ -17,6 +17,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from acceleration_forecasting_v2.common.constants import PHYSICAL_MAX, PHYSICAL_MIN
+
 from .build import ARRAY_NAMES
 from .cycle_features import CYCLE_FEATURE_NAME, NORMALIZATION_FILE, normalize_cycle_features
 from .normalization import Normalization
@@ -70,14 +72,38 @@ class ForecastDatasetV2(Dataset):
         if self.cycle_features is not None:
             item["cycle_features"] = torch.from_numpy(self._finite_zero(
                 normalize_cycle_features(self.cycle_features[index], self.cycle_feature_norm)).copy())
+            item["cycle_lines"] = torch.from_numpy(self._cycle_lines(self.cycle_features[index]))
         if self.include_targets:
             target = self._finite_zero(self.target_norm.normalize(self.targets[index]))
             item["target"] = torch.from_numpy(target.copy())
             item["target_mask"] = torch.from_numpy(self.target_masks[index].copy().astype(np.float32))
+            delta, delta_mask = self._delta_target(index)
+            item["delta_target"] = torch.tensor(delta, dtype=torch.float32)
+            item["delta_mask"] = torch.tensor(delta_mask, dtype=torch.float32)
             if self.target_synthetic_masks is not None:
                 item["target_synthetic_mask"] = torch.from_numpy(
                     self.target_synthetic_masks[index].copy().astype(np.float32))
         return item
+
+    def _cycle_lines(self, raw_features):
+        """D4の4本の直線(水準・30日あたりの傾き)を予測の12か月に延ばし、目標と同じ正規化にした値。shape (4, 12)。"""
+        raw = np.asarray(raw_features, dtype=np.float64)[:8].reshape(4, 2)
+        months = np.arange(1, 13, dtype=np.float64)[None, :]
+        lines = np.clip(raw[:, :1] + raw[:, 1:] * months, PHYSICAL_MIN, PHYSICAL_MAX)
+        return self._finite_zero(self.target_norm.normalize(lines)).copy()
+
+    def _delta_target(self, index):
+        """変化量Δ = (最後の有効3か月の目標の平均 − 起点の値)を目標の標準偏差で割った値と、有効かどうか(補助損失用)。"""
+        mask = np.asarray(self.target_masks[index]) > 0
+        values = np.asarray(self.targets[index], dtype=np.float64)
+        valid = mask & np.isfinite(values)
+        history = np.asarray(self.arrays["history_values"][index], dtype=np.float64)
+        history_valid = (np.asarray(self.arrays["history_masks"][index]) > 0) & np.isfinite(history)
+        if not valid.any() or not history_valid.any():
+            return 0.0, 0.0
+        current = history[np.flatnonzero(history_valid)[-1]]
+        last = np.flatnonzero(valid)[-3:]
+        return float((values[last].mean() - current) / self.target_norm.std), 1.0
 
     def denormalize_target(self, values):
         return self.target_norm.denormalize(values)

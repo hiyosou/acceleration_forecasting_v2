@@ -70,15 +70,17 @@ class DiffusionProcess:
         self.alpha_bars = self.alpha_bars.to(device)
         return self
 
-    def per_record_loss(self, batch, noise=None, timesteps=None):
+    def per_record_loss(self, batch, noise=None, timesteps=None, synthetic_weight=1.0):
         """マスク付きMSEをレコード単位で平均した損失を返す(shape: (batch,))。
 
         セグメント単位の重み付け(SPEC 1.1)は含まない — 呼び出し側
         (`training/loss.py`)がこれを`segment_weight`と組み合わせて集約する。
+        synthetic_weight(2026-11): 忘却因子Dで延長した合成月(`target_synthetic_mask`)の月ごとの重み。
+        1.0(既定)なら従来と同一。1未満なら合成月の寄与を下げた重み付き平均にする。
         """
-        return self._per_record_terms(batch, noise, timesteps)[0]
+        return self._per_record_terms(batch, noise, timesteps, synthetic_weight=synthetic_weight)[0]
 
-    def per_record_loss_with_slope(self, batch, noise=None, timesteps=None):
+    def per_record_loss_with_slope(self, batch, noise=None, timesteps=None, synthetic_weight=1.0):
         """(マスク付きMSE, 変化量・傾きの補助項)をレコード単位で返す(それぞれshape: (batch,))。
 
         補助項(2026-11、案A): 予測したεから正解の推定値 x̂0 = (x_t − sqrt(1−ᾱ)·ε̂)/sqrt(ᾱ) を作り、
@@ -87,9 +89,9 @@ class DiffusionProcess:
         """
         if self.prediction_type != "epsilon":
             raise ValueError("変化量・傾きの補助項はepsilon予測でだけ使えます")
-        return self._per_record_terms(batch, noise, timesteps, slope=True)
+        return self._per_record_terms(batch, noise, timesteps, slope=True, synthetic_weight=synthetic_weight)
 
-    def _per_record_terms(self, batch, noise, timesteps, slope=False):
+    def _per_record_terms(self, batch, noise, timesteps, slope=False, synthetic_weight=1.0):
         target, mask = batch["target"], batch["target_mask"]
         batch_size = target.shape[0]
         timesteps = timesteps if timesteps is not None else torch.randint(0, self.steps, (batch_size,), device=target.device)
@@ -103,8 +105,13 @@ class DiffusionProcess:
         else:
             expected = target
         predicted = self.model(noisy, timesteps, batch)
-        squared = (predicted - expected).square() * mask
-        per_record = squared.sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+        if float(synthetic_weight) != 1.0 and "target_synthetic_mask" in batch:
+            month_weight = mask * (1 - (1 - float(synthetic_weight)) * batch["target_synthetic_mask"])
+            squared = (predicted - expected).square() * month_weight
+            per_record = squared.sum(dim=1) / month_weight.sum(dim=1).clamp_min(1e-6)
+        else:
+            squared = (predicted - expected).square() * mask
+            per_record = squared.sum(dim=1) / mask.sum(dim=1).clamp_min(1)
         if not slope:
             return per_record, None
         return per_record, _slope_term(predicted, noise, mask, alpha)

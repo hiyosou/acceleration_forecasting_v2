@@ -36,7 +36,11 @@ def load_process(checkpoint_path, device, *, use_ema=True):
     context_residual_enabled = any("context_residual" in key for key in state_dict)
     model = ReferenceModulatedUNetV2(config["dropout"], context_residual_enabled=context_residual_enabled,
                                      cycle_feature_dim=config.get("cycle_feature_dim", 0),
-                                     history_months=config.get("history_months", HISTORY_MONTHS)).to(device)
+                                     history_months=config.get("history_months", HISTORY_MONTHS),
+                                     line_channels=config.get("line_channels", 0),
+                                     reference_source=config.get("reference_source", "guides"),
+                                     base_channels=config.get("base_channels", 64),
+                                     delta_head=config.get("delta_aux_weight", 0.0) > 0).to(device)
     model.load_state_dict(state_dict)
     model.eval()
     process = DiffusionProcess(model, config["diffusion_steps"], prediction_type=config["prediction_type"]).to(device)

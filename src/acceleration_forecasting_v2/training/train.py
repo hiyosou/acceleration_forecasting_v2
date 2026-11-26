@@ -123,8 +123,19 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
           seed=42, resume=True, progress=True, prediction_type="epsilon",
           diffusion_steps=1000, self_target_loss_weight=0.0, guide_mix_probability_zero=None,
           target_mode="absolute", cycle_features=False, secondary_validation_split=None,
-          slope_loss_weight=0.0):
+          slope_loss_weight=0.0, synthetic_month_weight=1.0, line_channels=0, reference_source="guides",
+          base_channels=64, delta_aux_weight=0.0):
     """RMAを学習する。dataset_dirは`write_dataset`が書き出したディレクトリ。
+
+    line_channels / reference_source / base_channels / delta_aux_weight: モデル構造の比較(2026-11)。
+        line_channels=4: D4の直線を12か月に延ばしたチャンネルをノイズ入力に並べる(--cycle-features が必要)。
+        reference_source: "guides"(既定)/"condition_tokens"(履歴とD4の直線をトークンにしたattention)/"none"(attentionなし)。
+        base_channels: U-Netの基本チャンネル数(既定64)。delta_aux_weight>0: 条件エンコーダから変化量Δを予測する補助損失の重み。
+        すべて既定値のときは従来と同一で、model_configにキーも足さない。
+
+    synthetic_month_weight: 学習損失での、忘却因子Dで延長した合成月(`target_synthetic_mask`)の月ごとの重み
+        (2026-11、実測月の精度を上げる試み)。1.0(既定)なら従来と同一。検証損失・best選定は常に従来どおり
+        (合成月も同じ重み)なので、他の実験と比較できる。epsilon・absolute専用。
 
     secondary_validation_split: 指定すると、そのsplit(例: `model_validation_flatcut`)の検証損失も毎エポック測り、
         主の検証(model_validation)とは別にbest・stale・checkpointを持つ(`best_model_secondary.pt`)。
@@ -208,11 +219,38 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
                     "self_target_loss_weight": self_target_loss_weight}
     if slope_loss_weight > 0:
         model_config["slope_loss_weight"] = slope_loss_weight
+    synthetic_month_weight = float(synthetic_month_weight)
+    if not 0.0 <= synthetic_month_weight <= 1.0:
+        raise ValueError("synthetic_month_weight must be in [0, 1]")
+    if synthetic_month_weight != 1.0:
+        if mixing or target_mode != "absolute" or self_target_loss_weight > 0:
+            raise ValueError("synthetic_month_weightは混合guide・残差方式・self_target_loss_weightとは併用できません")
+        model_config["synthetic_month_weight"] = synthetic_month_weight
     cycle_feature_dim = FEATURE_DIM if cycle_features else 0
     if cycle_features:
         if train_data.cycle_features is None or valid_data.cycle_features is None:
             raise ValueError("--cycle-features にはデータセットの cycle_features.npy が必要です。")
+        # 列数はデータから決める(D4の8個。追加特徴を足した検証では8より大きい)。
+        cycle_feature_dim = int(train_data.cycle_features.shape[1])
         model_config["cycle_feature_dim"] = cycle_feature_dim
+    line_channels, base_channels, delta_aux_weight = int(line_channels), int(base_channels), float(delta_aux_weight)
+    if line_channels and not cycle_features:
+        raise ValueError("line_channels には --cycle-features が必要です。")
+    if reference_source == "condition_tokens" and not cycle_features:
+        raise ValueError("reference_source=condition_tokens には --cycle-features が必要です。")
+    if delta_aux_weight < 0:
+        raise ValueError("delta_aux_weight must be non-negative")
+    if (line_channels or reference_source != "guides" or delta_aux_weight > 0) and (
+            mixing or target_mode != "absolute" or self_target_loss_weight > 0):
+        raise ValueError("構造の変更は混合guide・残差方式・self_target_loss_weightとは併用できません")
+    if line_channels:
+        model_config["line_channels"] = line_channels
+    if reference_source != "guides":
+        model_config["reference_source"] = reference_source
+    if base_channels != 64:
+        model_config["base_channels"] = base_channels
+    if delta_aux_weight > 0:
+        model_config["delta_aux_weight"] = delta_aux_weight
     # 履歴の長さはデータセットの配列の形から決める(拡張ウィンドウの18か月など、2026-11)。
     history_months = int(train_data.arrays["history_values"].shape[1])
     if int(valid_data.arrays["history_values"].shape[1]) != history_months:
@@ -240,8 +278,9 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
         return batch
 
     use_prepare = mixing or residual is not None
-    model = ReferenceModulatedUNetV2(dropout, history_months=history_months,
-                                     cycle_feature_dim=cycle_feature_dim).to(device)
+    model = ReferenceModulatedUNetV2(dropout, history_months=history_months, cycle_feature_dim=cycle_feature_dim,
+                                     line_channels=line_channels, reference_source=reference_source,
+                                     base_channels=base_channels, delta_head=delta_aux_weight > 0).to(device)
     process = DiffusionProcess(model, diffusion_steps, prediction_type=prediction_type).to(device)
     ema = EMA(model, ema_decay)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -303,10 +342,15 @@ def train(dataset_dir, output_dir, *, device=None, epochs=200, batch_size=128,
             noise = torch.randn_like(batch["target"])
             with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_cuda):
                 if slope_loss_weight > 0:
-                    per_record, slope_term = process.per_record_loss_with_slope(batch, noise=noise, timesteps=timesteps)
+                    per_record, slope_term = process.per_record_loss_with_slope(
+                        batch, noise=noise, timesteps=timesteps, synthetic_weight=synthetic_month_weight)
                     per_record = per_record + slope_loss_weight * slope_term
                 else:
-                    per_record = process.per_record_loss(batch, noise=noise, timesteps=timesteps)
+                    per_record = process.per_record_loss(
+                        batch, noise=noise, timesteps=timesteps, synthetic_weight=synthetic_month_weight)
+                if delta_aux_weight > 0:
+                    aux = (model.predict_delta(batch).float() - batch["delta_target"]).square() * batch["delta_mask"]
+                    per_record = per_record + delta_aux_weight * aux
                 if self_target_loss_weight > 0:
                     positions = batch["index"].cpu().numpy()
                     self_target_batch = build_self_target_batch(train_data, batch, current_values[positions])

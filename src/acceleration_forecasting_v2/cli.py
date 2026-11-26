@@ -116,6 +116,16 @@ def _parser():
                    help="データセットの cycle_features.npy(忘却因子Dの要約8個、add-cycle-features で作る)を条件入力に足す")
     p.add_argument("--slope-loss-weight", type=float, default=0.0,
                    help="0より大きいと、εのMSEに変化量・傾きの補助項をこの重みで足す(epsilon専用、既定0.0で従来と同一)")
+    p.add_argument("--synthetic-month-weight", type=float, default=1.0,
+                   help="学習損失での、忘却因子Dで延長した合成月の月ごとの重み(0〜1、既定1.0で従来と同一。"
+                        "検証損失・best選定は影響を受けない)")
+    p.add_argument("--line-channels", type=int, default=0,
+                   help="4なら、D4の直線を12か月に延ばしたチャンネルをノイズ入力に並べる(--cycle-features が必要、既定0で従来と同一)")
+    p.add_argument("--reference-source", choices=("guides", "condition_tokens", "none"), default="guides",
+                   help="条件の参照方式。condition_tokens: 履歴とD4の直線をトークンにしたattention、none: attentionなし(既定guides)")
+    p.add_argument("--base-channels", type=int, default=64, help="U-Netの基本チャンネル数(既定64)")
+    p.add_argument("--delta-aux-weight", type=float, default=0.0,
+                   help="0より大きいと、条件エンコーダから変化量Δを予測する補助損失をこの重みで足す(既定0.0で従来と同一)")
     p.add_argument("--secondary-validation-split",
                    help="2つ目の検証split(例: model_validation_flatcut)。別のbest(best_model_secondary.pt)を持ち、"
                         "両方がpatienceに達したら止める")
@@ -377,7 +387,10 @@ def main(argv=None) -> int:
                        guide_mix_probability_zero=args.guide_mix_probability_zero,
                        target_mode=args.target_mode, cycle_features=args.cycle_features,
                        secondary_validation_split=args.secondary_validation_split,
-                       slope_loss_weight=args.slope_loss_weight)
+                       slope_loss_weight=args.slope_loss_weight,
+                       synthetic_month_weight=args.synthetic_month_weight, line_channels=args.line_channels,
+                       reference_source=args.reference_source, base_channels=args.base_channels,
+                       delta_aux_weight=args.delta_aux_weight)
     elif args.command == "finetune-energy":
         from acceleration_forecasting_v2.training.energy import finetune_energy
         result = finetune_energy(args.dataset_dir, args.output_dir, init_checkpoint=args.init_checkpoint,

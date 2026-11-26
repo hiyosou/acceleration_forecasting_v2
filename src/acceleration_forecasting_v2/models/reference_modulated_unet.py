@@ -164,8 +164,10 @@ class ReferenceModulatedAttention(nn.Module):
 
     def forward(self, values, condition, references, reference_mask, similarities):
         batch, channels, length = values.shape
-        tokens = references.reshape(batch, 36, -1)
-        valid = reference_mask.reshape(batch, 36) > 0
+        # 参照トークン数は、guide(3位×12か月=36)が既定。条件トークン方式(2026-11)では別の数になる。
+        tokens = references.reshape(batch, -1, references.shape[-1])
+        count = tokens.shape[1]
+        valid = reference_mask.reshape(batch, count) > 0
         query_input = torch.cat([
             values.transpose(1, 2), condition[:, None, :].expand(-1, length, -1)
         ], dim=-1)
@@ -173,11 +175,11 @@ class ReferenceModulatedAttention(nn.Module):
             tokens, condition[:, None, :].expand(-1, tokens.shape[1], -1)
         ], dim=-1)
         q = self.query(query_input).reshape(batch, length, self.heads, self.head_dim).transpose(1, 2)
-        k = self.key(key_input).reshape(batch, 36, self.heads, self.head_dim).transpose(1, 2)
-        v = self.value(tokens).reshape(batch, 36, self.heads, self.head_dim).transpose(1, 2)
+        k = self.key(key_input).reshape(batch, count, self.heads, self.head_dim).transpose(1, 2)
+        v = self.value(tokens).reshape(batch, count, self.heads, self.head_dim).transpose(1, 2)
         scores = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
         if self.use_similarity_bias:
-            bias = similarities[:, :, None].expand(-1, -1, 12).reshape(batch, 1, 1, 36)
+            bias = similarities[:, :, None].expand(-1, -1, 12).reshape(batch, 1, 1, count)
             scores = scores + self.similarity_scale * bias
         effective_valid = valid[:, None, None, :]
         if self.attention_mode == "month_aligned":
@@ -203,22 +205,55 @@ class ReferenceModulatedAttention(nn.Module):
         return feature_delta, output_condition
 
 
+class ConditionTokenEncoder(nn.Module):
+    """条件トークン方式(2026-11): ガイドの代わりに、履歴の各月とD4の各直線を1トークンにしてattentionの参照にする。
+
+    履歴: 月ごとに(値, 有効マスク)+月の位置の埋め込み。D4: λごとに(水準, 傾き)+λの位置の埋め込み。
+    トークン数 = 履歴月数 + D4の直線数。
+    """
+
+    def __init__(self, history_months, line_count, dim=64):
+        super().__init__()
+        self.history_months, self.line_count = int(history_months), int(line_count)
+        self.history = nn.Sequential(nn.Linear(2, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.history_position = nn.Embedding(self.history_months, dim)
+        if self.line_count:
+            self.line = nn.Sequential(nn.Linear(2, dim), nn.SiLU(), nn.Linear(dim, dim))
+            self.line_position = nn.Embedding(self.line_count, dim)
+
+    def forward(self, history_values, history_masks, cycle_features):
+        batch = history_values.shape[0]
+        positions = torch.arange(self.history_months, device=history_values.device)
+        tokens = [self.history(torch.stack([history_values, history_masks], dim=-1)) + self.history_position(positions)]
+        mask = [history_masks]
+        if self.line_count:
+            lines = cycle_features[:, :2 * self.line_count].reshape(batch, self.line_count, 2)
+            line_positions = torch.arange(self.line_count, device=history_values.device)
+            tokens.append(self.line(lines) + self.line_position(line_positions))
+            mask.append(torch.ones(batch, self.line_count, device=history_values.device, dtype=history_masks.dtype))
+        return torch.cat(tokens, dim=1), torch.cat(mask, dim=1)
+
+
 class ReferenceModulatedBlock(nn.Module):
     """`models/reference_modulated_unet.py`の`ReferenceModulatedBlock`を無変更で移植。"""
 
     def __init__(self, channels, dropout=0.1, use_similarity_bias=True,
                  attention_mode="global", fusion_type="residual_delta", heads=8, head_dim=8,
-                 condition_dim=256, reference_dim=64, context_residual_enabled=True):
+                 condition_dim=256, reference_dim=64, context_residual_enabled=True, use_reference=True):
         super().__init__()
-        self.reference_attention = ReferenceModulatedAttention(
-            channels, use_similarity_bias=use_similarity_bias, attention_mode=attention_mode,
-            fusion_type=fusion_type, heads=heads, head_dim=head_dim,
-            condition_dim=condition_dim, reference_dim=reference_dim,
-            context_residual_enabled=context_residual_enabled,
-        )
+        self.use_reference = bool(use_reference)
+        if self.use_reference:
+            self.reference_attention = ReferenceModulatedAttention(
+                channels, use_similarity_bias=use_similarity_bias, attention_mode=attention_mode,
+                fusion_type=fusion_type, heads=heads, head_dim=head_dim,
+                condition_dim=condition_dim, reference_dim=reference_dim,
+                context_residual_enabled=context_residual_enabled,
+            )
         self.residual = ConditionalBlock(channels, dropout, condition_dim=condition_dim)
 
     def forward(self, values, condition, references, reference_mask, similarities):
+        if not self.use_reference:  # 参照なし(2026-11): attentionを使わず、条件ベクトルだけでFiLMする
+            return self.residual(values, condition)
         feature_delta, reference_condition = self.reference_attention(
             values, condition, references, reference_mask, similarities
         )
@@ -259,8 +294,24 @@ class ReferenceModulatedUNetV2(nn.Module):
         # 2026-10-27追加: 条件入力に足すサイクルの忘却因子Dの要約の次元(`datasets.cycle_features`)。
         # 0なら従来と同じモデル。
         cycle_feature_dim: int = 0,
+        # 2026-11追加(モデル構造の比較)。既定値では従来と完全に同じモデル(重みのキーも同じ)。
+        #   line_channels: >0 なら、D4の直線を予測の12か月に延ばした `batch["cycle_lines"]`(B, line_channels, 12)を
+        #                  ノイズ入力に並べて入力チャンネルにする(月ごとの水準・傾きを直接渡す)。
+        #   reference_source: "guides"(従来)/"condition_tokens"(履歴とD4の直線をトークンにしてattention。guideは使わない)/
+        #                     "none"(attentionなし。条件ベクトルのFiLMだけ)。
+        #   delta_head: Trueなら、条件エンコーダの出力から変化量Δを予測する補助ヘッドを持つ(`predict_delta`)。
+        line_channels: int = 0,
+        reference_source: Literal["guides", "condition_tokens", "none"] = "guides",
+        delta_head: bool = False,
     ):
         super().__init__()
+        if reference_source not in {"guides", "condition_tokens", "none"}:
+            raise ValueError("reference_source must be guides, condition_tokens or none")
+        self.line_channels = int(line_channels)
+        self.reference_source = reference_source
+        self.has_delta_head = bool(delta_head)
+        if reference_source == "condition_tokens":
+            reference_attention_mode = "global"  # month_alignedはguide(3位×12か月)専用
         self.cycle_feature_dim = int(cycle_feature_dim)
         self.history_months = int(history_months)
         self.forecast_months = int(forecast_months)
@@ -291,17 +342,24 @@ class ReferenceModulatedUNetV2(nn.Module):
             nn.Linear(2 * self.history_months + self.cycle_feature_dim, condition_half), nn.SiLU(), nn.Linear(condition_half, condition_half)
         )
         self.time_encoder = TimeEmbedding(condition_half)
-        self.reference_encoder = GuideEncoder12(
-            guide_dim=self.reference_dim, include_similarity=self.reference_similarity_enabled
-        )
+        if self.reference_source == "guides":
+            self.reference_encoder = GuideEncoder12(
+                guide_dim=self.reference_dim, include_similarity=self.reference_similarity_enabled
+            )
+        elif self.reference_source == "condition_tokens":
+            self.token_encoder = ConditionTokenEncoder(
+                self.history_months, min(self.cycle_feature_dim, 8) // 2, self.reference_dim)  # 先頭8個がD4の4本の直線
+        if self.has_delta_head:
+            self.delta_head = nn.Sequential(nn.Linear(condition_half, 64), nn.SiLU(), nn.Linear(64, 1))
 
-        self.input = nn.Conv1d(1, c1, 3, padding=1)
+        self.input = nn.Conv1d(1 + self.line_channels, c1, 3, padding=1)
         block = lambda channels: ReferenceModulatedBlock(
-            channels, dropout, use_similarity_bias=self.reference_similarity_enabled,
+            channels, dropout, use_similarity_bias=self.reference_similarity_enabled and self.reference_source == "guides",
             attention_mode=self.reference_attention_mode, fusion_type=self.reference_fusion_type,
             heads=self.attention_heads, head_dim=self.attention_head_dim,
             condition_dim=self.condition_dim, reference_dim=self.reference_dim,
             context_residual_enabled=self.context_residual_enabled,
+            use_reference=self.reference_source != "none",
         )
         self.enc12 = nn.ModuleList([block(c1) for _ in range(self.block_counts[0])])
         self.down6 = nn.Conv1d(c1, c2, 3, stride=2, padding=1)
@@ -341,6 +399,21 @@ class ReferenceModulatedUNetV2(nn.Module):
         return {"reference_context_norm": sum(norms) / max(len(norms), 1),
                 **{f"attention_rank_{index + 1}": float(value) for index, value in enumerate(rank)}}
 
+    def _condition_vector(self, batch):
+        """履歴・マスク(+サイクル特徴)を条件エンコーダに通した、時刻を含まない条件ベクトル(condition_dim/2)。"""
+        parts = [batch["history_values"], batch["history_masks"]]
+        if self.cycle_feature_dim:
+            if "cycle_features" not in batch:
+                raise KeyError("cycle_feature_dim > 0 のモデルには batch['cycle_features'] が必要です。")
+            parts.append(batch["cycle_features"])
+        return self.condition_encoder(torch.cat(parts, dim=-1))
+
+    def predict_delta(self, batch):
+        """補助ヘッド: 条件だけから変化量Δ(目標の標準偏差で割った値)を予測する。shape (batch,)。"""
+        if not self.has_delta_head:
+            raise RuntimeError("delta_head=True で作ったモデルだけが使えます。")
+        return self.delta_head(self._condition_vector(batch)).squeeze(-1)
+
     def forward(self, noisy, timesteps, batch):
         """
         Args:
@@ -353,18 +426,26 @@ class ReferenceModulatedUNetV2(nn.Module):
         Returns:
             shape (batch, forecast_months)。
         """
-        parts = [batch["history_values"], batch["history_masks"]]
-        if self.cycle_feature_dim:
-            if "cycle_features" not in batch:
-                raise KeyError("cycle_feature_dim > 0 のモデルには batch['cycle_features'] が必要です。")
-            parts.append(batch["cycle_features"])
-        condition_input = torch.cat(parts, dim=-1)
-        condition = torch.cat([self.condition_encoder(condition_input), self.time_encoder(timesteps)], dim=-1)
-        references = self.reference_encoder(batch["guide_values"], batch["guide_deltas"], batch["guide_similarities"])
-        reference_mask = batch["guide_mask"] * batch["retrieval_mask"].unsqueeze(-1)
-        similarities = batch["guide_similarities"]
+        condition = torch.cat([self._condition_vector(batch), self.time_encoder(timesteps)], dim=-1)
+        similarities = None
+        if self.reference_source == "guides":
+            references = self.reference_encoder(batch["guide_values"], batch["guide_deltas"], batch["guide_similarities"])
+            reference_mask = batch["guide_mask"] * batch["retrieval_mask"].unsqueeze(-1)
+            similarities = batch["guide_similarities"]
+        elif self.reference_source == "condition_tokens":
+            references, reference_mask = self.token_encoder(
+                batch["history_values"], batch["history_masks"], batch.get("cycle_features"))
+        else:
+            references = reference_mask = None
+        if self.reference_source != "guides":
+            similarities = noisy.new_zeros(noisy.shape[0], 3)
 
-        x12 = self._run(self.input(noisy[:, None]), self.enc12, condition, references, reference_mask, similarities)
+        inputs = noisy[:, None]
+        if self.line_channels:
+            if "cycle_lines" not in batch:
+                raise KeyError("line_channels > 0 のモデルには batch['cycle_lines'] が必要です。")
+            inputs = torch.cat([inputs, batch["cycle_lines"][:, :self.line_channels]], dim=1)
+        x12 = self._run(self.input(inputs), self.enc12, condition, references, reference_mask, similarities)
         x6 = self._run(self.down6(x12), self.enc6, condition, references, reference_mask, similarities)
         x3 = self._run(self.down3(x6), self.mid3, condition, references, reference_mask, similarities)
         y6 = self._run(self.merge6(torch.cat([self.up6(x3), x6], dim=1)), self.dec6,
